@@ -79,3 +79,52 @@ def test_the_orion_profile_no_longer_loads_a_cuda_module():
         (Path(__file__).resolve().parents[2] / "src" / "cspflow" / "machines"
          / "orion.yaml").read_text())
     assert profile["modules"]["gpu"] == []
+
+
+# -- path-valued environment settings --------------------------------------
+
+def test_a_missing_env_path_is_a_failure(tmp_path):
+    """One of these is load-bearing and fails unreadably.
+
+    Without `I_MPI_PMI_LIBRARY`, Intel MPI under `srun --mpi=pmi2` aborts in
+    `PMPI_Init` behind a wall of `mpi/pmi2: request not begin with 'cmd='`,
+    naming neither the variable nor the library. Four VASP jobs died in three
+    seconds each on the first live submission.
+    """
+    from cspflow.doctor import check_env_paths
+
+    check = check_env_paths(Machine(scheduler="slurm",
+                                    env={"I_MPI_PMI_LIBRARY": str(tmp_path / "nope.so")}))
+    assert check.status == "fail"
+    assert any("MISSING" in row for row in check.rows)
+
+
+def test_an_env_path_that_exists_passes(tmp_path):
+    from cspflow.doctor import check_env_paths
+
+    lib = tmp_path / "libpmi.so.0"
+    lib.write_text("")
+    check = check_env_paths(Machine(scheduler="slurm",
+                                    env={"I_MPI_PMI_LIBRARY": str(lib)}))
+    assert check.status == "ok"
+
+
+def test_non_path_settings_are_left_alone():
+    from cspflow.doctor import check_env_paths
+
+    check = check_env_paths(Machine(scheduler="slurm",
+                                    env={"OMP_NUM_THREADS": "1",
+                                         "I_MPI_FABRICS": "shm:ofi"}))
+    assert check.status == "ok"
+    assert check.rows == []
+
+
+def test_the_orion_profile_sets_the_pmi_library():
+    from pathlib import Path
+
+    import yaml
+
+    profile = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "src" / "cspflow" / "machines"
+         / "orion.yaml").read_text())
+    assert profile["env"]["I_MPI_PMI_LIBRARY"].endswith("libpmi.so.0")

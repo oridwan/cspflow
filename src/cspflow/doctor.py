@@ -262,6 +262,30 @@ def check_modules(machine: Machine) -> Check:
                  rows)
 
 
+def check_env_paths(machine: Machine) -> Check:
+    """Every profile env value that looks like a path must exist.
+
+    One of them is load-bearing and fails unreadably: without
+    `I_MPI_PMI_LIBRARY`, Intel MPI under `srun --mpi=pmi2` aborts in
+    `PMPI_Init` with a wall of `mpi/pmi2: request not begin with 'cmd='`, which
+    names neither the variable nor the library. Four VASP jobs died in three
+    seconds each on the first live submission.
+    """
+    paths = {k: str(v) for k, v in machine.env.items() if str(v).startswith("/")}
+    if not paths:
+        return Check("environment", "ok", "no path-valued environment settings")
+
+    rows, worst = [], "ok"
+    for key, value in sorted(paths.items()):
+        if Path(value).exists():
+            rows.append(f"{key:<20} {value}")
+        else:
+            rows.append(f"{key:<20} {value}   MISSING")
+            worst = "fail"
+    return Check("environment", worst,
+                 "a missing library here fails inside MPI, not at the export", rows)
+
+
 def check_vasp(machine: Machine) -> Check:
     path = machine.codes.vasp_std
     if not path:
@@ -501,6 +525,7 @@ def run(cfg: ResolvedConfig, *, elements: list[str] | None = None, fix: bool = F
         report.add(Check("POTCAR resolution", "skip",
                          "no elements yet -- run `csp source` first, or pass --elements"))
     report.add(check_modules(cfg.machine))
+    report.add(check_env_paths(cfg.machine))
     report.add(check_vasp(cfg.machine))
     report.add(check_scheduler(cfg.machine))
     report.add(check_qos_limits())

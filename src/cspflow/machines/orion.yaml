@@ -41,6 +41,13 @@ modules:
 env:
   OMP_NUM_THREADS: 1
   I_MPI_FABRICS: "shm:ofi"
+  # Intel MPI has to be told which PMI library SLURM provides. Without it
+  # `srun --mpi=pmi2` starts, the pmi2 plugin rejects every client request
+  # ("request not begin with 'cmd='"), and PMPI_Init aborts -- an error that
+  # names neither the variable nor the library. Verified 2026-08-27: this path
+  # exists on Orion/Apus and /opt/slurm/lib/libpmi.so does not.
+  # `csp doctor` checks that every env value that looks like a path is there.
+  I_MPI_PMI_LIBRARY: /usr/lib64/libpmi.so.0
 
 # Your installation, not Shuo's.
 codes:
