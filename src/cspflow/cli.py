@@ -375,6 +375,45 @@ def screen_worker(
     typer.echo(str(out))
 
 
+@app.command()
+def report(
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
+    set_: SetOpt = None,
+    out: Annotated[Optional[Path], typer.Option("--out", "-o", help="directory for report.html and candidates.csv")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="rows in the table; 0 for all")] = 2000,
+) -> None:
+    """Write the candidate table and a self-contained HTML dashboard.
+
+    This is the direct answer to "seeing results is difficult": one file that
+    opens in a browser with no server, no build step and no network, plus the
+    same table as CSV for anything downstream.
+    """
+    from .report.candidates import candidate_rows, funnel, write_csv
+    from .report.html import write as write_html
+
+    cfg = _load(campaign, set_)
+    db = _db_path(cfg)
+    if not db.is_file():
+        _die(f"no campaign database at {db}. Run `csp init` and then a stage.")
+
+    directory = out or (Path(cfg.campaign.workdir) / "report")
+    with Store.open(db) as store:
+        rows = candidate_rows(store, limit=limit or None)
+        csv_path = write_csv(rows, directory / "candidates.csv")
+        html_path = write_html(store, directory / "report.html",
+                               title=cfg.campaign.name, limit=limit or None)
+        counts = funnel(store)
+
+    typer.echo(counts.render())
+    typer.echo("")
+    typer.echo(f"{len(rows)} candidate(s)")
+    typer.echo(f"table  {csv_path}")
+    typer.echo(f"report {html_path}")
+    if not rows:
+        typer.secho("no candidates yet -- nothing has reached dft_done",
+                    fg=typer.colors.YELLOW, err=True)
+
+
 @app.command("generate-worker", hidden=True)
 def generate_worker(
     manifest: Annotated[Path, typer.Option("--manifest", help="written by the generate stage")],

@@ -39,12 +39,26 @@ class ReferenceStage:
         self.last_snapshots: dict[str, str] = {}
 
     def pending(self, store: Store) -> int:
-        """Chemical systems with screened structures but no hull placement yet."""
+        """Work for this stage: structures to place, or a reference set to fetch.
+
+        Two triggers, not one. The obvious trigger is screened structures with
+        no hull placement. The second is a chemical system that has results in
+        it and no reference entries at all -- which is the state an *ingested*
+        campaign starts in, because its structures arrive already at
+        `dft_done` and never pass through screening. Without it the DFT hull in
+        `analyze` has nothing to measure against and refuses, correctly, for a
+        reason the user cannot act on.
+        """
         rows = store.sql.execute(
-            "SELECT COUNT(DISTINCT chemsys) n FROM composition"
-        ).fetchone()
+            "SELECT COUNT(DISTINCT chemsys) n FROM composition").fetchone()
         if not rows or not rows["n"]:
             return 0
+
+        entries = store.sql.execute(
+            "SELECT COUNT(*) n FROM reference_entry").fetchone()["n"]
+        if not entries and store.count_structures(state=StructureState.dft_done.value):
+            return int(rows["n"])
+
         placed = store.sql.execute("SELECT COUNT(*) n FROM hull").fetchone()["n"]
         screened = store.count_structures(state=StructureState.screened.value)
         return 0 if (screened == 0 or placed >= screened) else screened

@@ -198,6 +198,11 @@ def ingest_campaign(
                 "composition_id": comp_id,
                 "formula_dir": formula,
                 "source_path": str(structure_dir),
+                # The directory holding the outputs `analyze` will read. Recorded
+                # under the same key the DFT stage uses, so an ingested campaign
+                # and a native one are the same thing to every later stage --
+                # which is what makes replaying an old campaign a real test.
+                "dft_dir": str(job_dirs[-1].resolve()),
                 "converged": last.converged,
             }
             if last.energy is not None:

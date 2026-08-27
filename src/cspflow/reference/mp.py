@@ -323,7 +323,7 @@ def _query(chemsys: str, thermo_type: str, api_key: str | None) -> list[Any]:
                 chemsys=sub_systems(chemsys),
                 fields=["material_id", "formula_pretty", "chemsys", "thermo_type",
                         "energy_per_atom", "uncorrected_energy_per_atom",
-                        "energy_above_hull", "nsites"],
+                        "energy_above_hull", "nsites", "energy_type"],
             )
     # Filtered here rather than in the query so that what MP offered and what we
     # kept are both visible, and the discarded types can be reported.
@@ -350,7 +350,18 @@ def _to_entries(docs: list[Any], thermo_type: str) -> tuple[list[ReferenceEntry]
             e_raw_per_atom=_float(getattr(doc, "uncorrected_energy_per_atom", None)),
             e_corrected_per_atom=_float(getattr(doc, "energy_per_atom", None)),
             e_above_hull_mp=_float(getattr(doc, "energy_above_hull", None)),
-            run_type=thermo_type,
+            # `energy_type` is the functional that produced *this document's*
+            # energy -- 'GGA' or 'GGA+U'. `thermo_type` is the name of the
+            # mixing scheme the document was drawn from, and is the same string
+            # for every row in the set.
+            #
+            # Storing the latter under `run_type` made every entry claim the
+            # same functional, which is exactly the condition `assert_one_
+            # functional` exists to detect: the guard saw one uniform value and
+            # passed a set that mixed GGA and GGA+U. Verified against MP: a
+            # Co-Gd query returns thermo_type='GGA_GGA+U' with energy_type='GGA'
+            # on every document.
+            run_type=str(getattr(doc, "energy_type", "") or "") or thermo_type,
         ))
     if not entries:
         warnings.append(

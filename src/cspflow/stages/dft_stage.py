@@ -42,6 +42,7 @@ from .base import StageReport, WorkItem
 # Where a structure is in the recipe, stored on the row rather than inferred
 # from the filesystem so that a restarted driver reads it rather than guessing.
 STEP_KEY = "dft_step"
+DIR_KEY = "dft_dir"
 ATTEMPT_KEY = "dft_attempt"
 
 
@@ -181,13 +182,19 @@ class DftStage:
                 )
 
             if outcome.converged:
-                self._advance(store, sid, step, outcome)
+                self._advance(store, sid, step, outcome, directory)
             else:
                 self._retry_or_fail(store, sid, step, step_name, outcome, status, item)
 
-    def _advance(self, store: Store, sid: int, step: int, outcome) -> None:
+    def _advance(self, store: Store, sid: int, step: int, outcome,
+                 directory: Path) -> None:
         """This step succeeded.  Move to the next, or finish."""
-        kv: dict[str, Any] = {STEP_KEY: step + 1, ATTEMPT_KEY: 0}
+        # Where the outputs are, recorded on the row rather than left to be
+        # rebuilt from a filename convention later. `analyze` reads it: the
+        # alternative is a second place that knows how job directories are
+        # named, and two such places drift.
+        kv: dict[str, Any] = {STEP_KEY: step + 1, ATTEMPT_KEY: 0,
+                              DIR_KEY: str(directory.resolve())}
         if outcome.energy is not None:
             kv["vasp_energy"] = outcome.energy
         if outcome.e_per_atom is not None:
