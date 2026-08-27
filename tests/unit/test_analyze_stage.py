@@ -234,3 +234,27 @@ def test_every_funnel_stage_now_has_an_implementation():
     assert PLANNED == {}
     assert set(IMPLEMENTED) == set(STAGE_ORDER)
     assert IMPLEMENTED == STAGE_ORDER
+
+
+def test_a_mixed_scale_hull_says_so_once(cfg, store, tmp_path):
+    """Our DFT and MP's are two absolute scales. Measured on four MP structures
+    through this campaign's own settings, they differ by a per-element offset
+    near +0.2 eV per Fe atom -- and Sm2Fe17, which IS mp-1426, was reported at
+    0.2098 eV above the hull instead of the ~0.02 a reference phase must have.
+    """
+    job = make_job(tmp_path)
+    add_done(store, tmp_path, energy=-20.0, **{DIR_KEY: str(job), "z": 1})
+    add_reference(store, "Gd1", -3.0, "Gd")
+    add_reference(store, "Co1", -5.0, "Co")
+
+    note = AnalyzeStage(cfg).run(store).note
+    assert "mixes our DFT with MP's" in note
+    assert note.count("mixes our DFT") == 1
+
+
+def test_a_hull_of_our_own_energies_alone_does_not_warn(cfg, store, tmp_path):
+    """Nothing to mix: the warning must not become background noise."""
+    job = make_job(tmp_path)
+    add_done(store, tmp_path, energy=-20.0, **{DIR_KEY: str(job), "z": 1})
+    note = AnalyzeStage(cfg).run(store).note
+    assert "mixes our DFT" not in note

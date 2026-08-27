@@ -42,6 +42,32 @@ DIR_KEY = "dft_dir"
 # not re-read a 10 MB OUTCAR for every finished structure in the campaign.
 DONE_KEY = "analyzed"
 
+# Said once per run, not once per structure.
+#
+# `reference.mode` defaults to `recompute` and is wired to nothing, so the DFT
+# hull is built from our energies against MP's -- two different absolute scales.
+# Measured 2026-08-27 by running four MP structures through this campaign's own
+# settings, as a static at MP's own geometry:
+#
+#     Fe (mp-13)      ours - MP  +0.2068 eV/atom
+#     Sm2Fe17         +0.1870      SmFe11Ti  +0.1794      SmFe2  +0.1530
+#
+# A three-element least squares fits all four to within 1.8 meV/atom with
+# Fe +0.2056, Sm +0.0462, Ti +0.0247 eV per atom of that element -- a clean
+# per-element offset. It cancels exactly in a hull built on ONE scale (D067) and
+# not at all in one built on two: our candidate carries its offset and MP's
+# vertices do not, so every e_above_hull is inflated by the candidate's own.
+#
+# The check that settles it: Sm2Fe17 in this campaign is mp-1426 exactly (R-3m,
+# volume within 0.17%, RMS 0.002 A). It was reported at 0.2098 eV/atom above the
+# hull. Subtract its measured offset and it is +0.023 -- on the hull, where the
+# reference phase must be.
+SCALE_WARNING = (
+    "e_above_hull mixes our DFT with MP's on one hull. Measured on four MP "
+    "structures through these settings, that is a per-element offset near "
+    "+0.2 eV per Fe atom, which inflates every value by the candidate's own "
+    "share of it -- see DECISIONS.md D101")
+
 
 class AnalyzeStage:
     name = "analyze"
@@ -152,8 +178,11 @@ class AnalyzeStage:
 
         placed: list[str] = []
         notes: list[tuple[str, str]] = []
+        mixed_scale = False
         for system, entries in sorted(ours.items()):
             reference = self._reference_entries(store, system)
+            if reference and entries:
+                mixed_scale = True
             try:
                 result = build_hull([*reference, *entries])
             except HullError as exc:
@@ -171,7 +200,11 @@ class AnalyzeStage:
                                    key="dft_e_above_hull", source="dft",
                                    value=float(result.e_above_hull[entry.label]))
             placed.append(system)
-        return placed, _summarise(notes)
+
+        summary = _summarise(notes)
+        if mixed_scale:
+            summary = (SCALE_WARNING + ("; " + summary if summary else ""))
+        return placed, summary
 
     @staticmethod
     def _our_entries(store: Store) -> dict[str, list[Entry]]:
