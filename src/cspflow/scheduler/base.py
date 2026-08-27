@@ -186,7 +186,13 @@ def compute_throttle(
     limits = limits or Limits()
     binding = "config"
 
-    in_flight = requested_in_flight
+    # `max_in_flight` means "this many out at once", so work already queued
+    # comes out of it whether or not the site publishes a cap. Subtracting only
+    # under a QOS limit meant an unlimited site resubmitted its whole budget
+    # every cycle.
+    in_flight = max(0, requested_in_flight - already_in_flight)
+    if in_flight < requested_in_flight:
+        binding = f"config max_in_flight={requested_in_flight}, {already_in_flight} already out"
     if limits.max_submit is not None:
         room = max(0, limits.max_submit - already_in_flight)
         if room < in_flight:
