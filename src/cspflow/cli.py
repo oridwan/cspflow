@@ -14,6 +14,7 @@ from . import __version__, doctor as doctor_mod
 from .config.loader import ConfigError, load_campaign
 from .config.schema import Campaign
 from .db.store import Store, StoreError
+from .ingest import IngestError, ingest_campaign
 from .templates import scaffold
 
 app = typer.Typer(
@@ -156,6 +157,47 @@ def doctor(
     typer.echo(report.render())
     if report.failed:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def ingest(
+    root: Annotated[Path, typer.Argument(help="existing campaign directory to import")],
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
+    set_: SetOpt = None,
+    limit: Annotated[Optional[int], typer.Option("--limit", "-n", help="only this many formula directories")] = None,
+    source_name: Annotated[str, typer.Option("--source-name")] = "ingested",
+    db: Annotated[Optional[Path], typer.Option("--db", help="write here instead of the campaign workdir")] = None,
+    quiet: Annotated[bool, typer.Option("--quiet", "-q")] = False,
+) -> None:
+    """Import an existing campaign directory into a cspflow database.
+
+    `--limit` caps the number of formula directories, which is what makes this
+    quick to sanity-check: a handful exercises every code path that all of them
+    would.
+    """
+    cfg = _load(campaign, set_)
+    target = db or _db_path(cfg)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    store = Store.open(target) if target.is_file() else Store.create(
+        target, campaign=cfg.campaign.name, config_hash=cfg.config_hash
+    )
+    seen = 0
+
+    def progress(formula: str) -> None:
+        nonlocal seen
+        seen += 1
+        if not quiet:
+            typer.echo(f"  [{seen}] {formula}", err=True)
+
+    with store:
+        try:
+            stats = ingest_campaign(root, store, limit=limit, source_name=source_name,
+                                    progress=None if quiet else progress)
+        except IngestError as exc:
+            _die(str(exc))
+    typer.echo(stats.render())
+    typer.echo(f"\nwrote {target}")
 
 
 @app.command()
