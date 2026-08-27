@@ -126,6 +126,24 @@ class DftStage:
         room = max(int(cap) - spent, 0)
         return (started + fresh)[:max(room, len(started))]
 
+    def resource_hint(self) -> tuple[int, str]:
+        """(ntasks, walltime) for one task, from the recipe's own resources.
+
+        The driver's budget estimate has to come from here: the DFT resources
+        live per recipe step, not in the campaign's `dft:` block, so nothing
+        outside this stage can find them.  The longest step is used, since the
+        estimate is a ceiling.
+        """
+        ntasks, hours, walltime = 0, 0.0, "24:00:00"
+        for stage in self.recipe.stages:
+            resources = {**self.recipe.stages[0].resources, **stage.resources}
+            ntasks = max(ntasks, int(resources.get("ntasks", 0) or 0))
+            time = str(resources.get("time", "24:00:00"))
+            parsed = _hours(time)
+            if parsed > hours:
+                hours, walltime = parsed, time
+        return ntasks or self.cfg.machine.defaults.ntasks, walltime
+
     def _pilot_gate(self, store: Store) -> str:
         """Why the expensive tier is held, or "" if it is open.
 
@@ -498,3 +516,14 @@ def _entered_dft(store: Store) -> int:
                     or kv.get("dft_fail_reason"):
                 seen.add(int(row.id))
     return len(seen)
+
+
+def _hours(walltime: str) -> float:
+    """`[D-]HH:MM:SS` as hours."""
+    days, _, rest = walltime.partition("-")
+    if not rest:
+        days, rest = "0", walltime
+    parts = [float(p) for p in rest.split(":")]
+    while len(parts) < 3:
+        parts.append(0.0)
+    return float(days) * 24 + parts[0] + parts[1] / 60 + parts[2] / 3600

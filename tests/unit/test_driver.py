@@ -552,3 +552,25 @@ def test_the_job_row_records_the_recipe_step_and_attempt(cfg, store):
     rows = store.jobs(stage="dft")
     assert rows and all(r["recipe_step"] == "relax" for r in rows)
     assert all(r["attempt"] == 2 for r in rows)
+
+
+def test_the_budget_estimate_asks_the_stage_for_its_resources(cfg, store):
+    """`dft` was missing from the table this used to be, so it fell through to
+    the machine default and a bare 24-hour walltime -- 384 core-hours against a
+    recipe asking for 32.
+
+    Over-estimating errs in the safe direction and makes the budget useless: a
+    200,000 core-hour allocation would approve 520 jobs instead of 6,250.
+    """
+
+    class Hinted(FakeStage):
+        def resource_hint(self):
+            return 16, "02:00:00"
+
+    d = driver(cfg, store, FakeScheduler(), [Hinted(work=1)], stages=["dft"])
+    assert d._walltime_estimate("dft") == pytest.approx(32.0)
+
+
+def test_a_stage_with_no_hint_falls_back_to_the_configured_resources(cfg, store):
+    d = driver(cfg, store, FakeScheduler(), [FakeStage(work=1)], stages=["dft"])
+    assert d._walltime_estimate("screen") > 0

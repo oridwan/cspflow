@@ -456,7 +456,10 @@ def status(
         # shortfall here is invisible below it: the funnel narrows anyway, and
         # 40% fewer candidates entering it looks exactly like a smaller campaign.
         gen = store.generation_yield()
-        if gen["compositions"]:
+        # Only when something was actually asked for: a seeded campaign has
+        # compositions in state `generated` with nothing requested, and
+        # "0 of 0 requested (0.0%)" reads as a failure rather than as silence.
+        if gen["requested"]:
             pct = 100.0 * gen["produced"] / gen["requested"] if gen["requested"] else 0.0
             line = (f"generated    {gen['produced']:,} of {gen['requested']:,} "
                     f"requested ({pct:.1f}%)")

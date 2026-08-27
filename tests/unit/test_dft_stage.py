@@ -591,3 +591,21 @@ class TestTheNextStepStartsFromTheRelaxedGeometry:
         items = DftStage(cfg).claim(store, budget=1)
         assert items[0].payload["step"] == 0
         assert "started_from" not in items[0].payload
+
+
+def test_the_resource_hint_comes_from_the_recipe(cfg):
+    """DFT resources live per recipe step, not in the campaign's `dft:` block,
+    so nothing outside this stage can find them."""
+    ntasks, walltime = DftStage(cfg).resource_hint()
+    assert ntasks > 0
+    assert walltime.count(":") == 2
+
+
+@pytest.mark.parametrize("text,hours", [
+    ("02:00:00", 2.0), ("12:30:00", 12.5), ("1-00:00:00", 24.0),
+    ("2-06:00:00", 54.0), ("00:45:00", 0.75),
+])
+def test_walltime_parsing(text, hours):
+    from cspflow.stages.dft_stage import _hours
+
+    assert _hours(text) == pytest.approx(hours)

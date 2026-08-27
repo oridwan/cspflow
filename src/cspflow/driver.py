@@ -368,14 +368,29 @@ class Driver:
         return self._walltime_estimate(job["stage"])
 
     def _walltime_estimate(self, stage: str) -> float:
-        resources = {
-            "generate": self.cfg.campaign.generate.resources if self.cfg.campaign.generate else None,
-            "screen": self.cfg.campaign.screen.resources,
-        }.get(stage)
-        ntasks = (resources.ntasks if resources and resources.ntasks
-                  else self.cfg.machine.defaults.ntasks)
-        hours = _walltime_hours(resources.time if resources else "24:00:00")
-        return hours * ntasks
+        """Core-hours one item of `stage` might cost, before any have finished.
+
+        Asked of the stage where it can answer. `dft` was missing from the table
+        this used to be, so it fell through to the machine default and a bare
+        24-hour walltime -- 384 core-hours against a recipe asking for 32. A
+        12x over-estimate errs in the safe direction and makes the budget
+        useless: a 200,000 core-hour allocation would approve 520 jobs instead
+        of 6,250 and the campaign would crawl.
+        """
+        implementation = next((s for s in self.stages if s.name == stage), None)
+        hint = getattr(implementation, "resource_hint", None)
+        if hint is not None:
+            ntasks, walltime = hint()
+        else:
+            resources = {
+                "generate": (self.cfg.campaign.generate.resources
+                             if self.cfg.campaign.generate else None),
+                "screen": self.cfg.campaign.screen.resources,
+            }.get(stage)
+            ntasks = (resources.ntasks if resources and resources.ntasks
+                      else self.cfg.machine.defaults.ntasks)
+            walltime = resources.time if resources else "24:00:00"
+        return _walltime_hours(walltime) * (ntasks or self.cfg.machine.defaults.ntasks)
 
     # -- submission --------------------------------------------------------
 
