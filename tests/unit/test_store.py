@@ -363,3 +363,20 @@ class TestRelaxationOutcomes:
             summary = s.summary()
         assert summary["core_hours"] == 12.5
         assert summary["relaxations"] == {"vasp:relax:not converged": 1}
+
+
+def test_an_array_may_share_one_scheduler_id(tmp_path):
+    """Many rows, one id, one submission -- this is the normal case."""
+    with Store.create(tmp_path / "c.db", campaign="t") as store:
+        for _ in range(3):
+            row = store.add_job(stage="screen", workdir="/w")
+            store.update_job(row, state="queued", slurm_id="42")
+        store.assert_job_id_is_new("42", "screen", "/w")     # does not raise
+
+
+def test_a_reused_scheduler_id_is_refused(tmp_path):
+    with Store.create(tmp_path / "c.db", campaign="t") as store:
+        row = store.add_job(stage="generate", workdir="/w/generate")
+        store.update_job(row, state="queued", slurm_id="local-1")
+        with pytest.raises(StoreError, match="already recorded for stage"):
+            store.assert_job_id_is_new("local-1", "screen", "/w/screen")

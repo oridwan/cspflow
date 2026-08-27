@@ -23,7 +23,7 @@ from ase import Atoms
 from ase.db import connect as ase_connect
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 # ASE key_value_pairs accept only these.  A list, dict or None raises
 # ValueError deep inside ASE; we catch it at the boundary with a message that
@@ -79,9 +79,11 @@ class CompositionRow:
     z: int
     n_atoms: int
     n_target: int
+    n_produced: int
     source_mode: str
     source_name: str
     state: str
+    fail_reason: str = ""
 
 
 def _clean_kv(kv: dict[str, Any]) -> dict[str, Any]:
@@ -351,18 +353,49 @@ class Store:
         return [
             CompositionRow(
                 id=r["id"], formula=r["formula"], chemsys=r["chemsys"], z=r["z"],
-                n_atoms=r["n_atoms"], n_target=r["n_target"], source_mode=r["source_mode"],
+                n_atoms=r["n_atoms"], n_target=r["n_target"],
+                n_produced=r["n_produced"], source_mode=r["source_mode"],
                 source_name=r["source_name"], state=r["state"],
+                fail_reason=r["fail_reason"],
             )
             for r in self.sql.execute(q, args)
         ]
 
-    def set_composition_state(self, cid: int, state: str, fail_reason: str = "") -> None:
-        self.sql.execute(
-            "UPDATE composition SET state=?, fail_reason=? WHERE id=?",
-            (state, fail_reason, cid),
-        )
+    def set_composition_state(self, cid: int, state: str, fail_reason: str = "",
+                              n_produced: int | None = None) -> None:
+        """Move a composition to a new state, optionally recording its yield.
+
+        `n_produced` is separate from the state on purpose.  "generated" says
+        the generator ran and returned something; it does not say it returned
+        what was asked for.  A campaign that quietly gets 60% of its requested
+        structures back looks identical, at the state level, to one that gets
+        100% -- so the number is stored rather than inferred.
+        """
+        if n_produced is None:
+            self.sql.execute(
+                "UPDATE composition SET state=?, fail_reason=? WHERE id=?",
+                (state, fail_reason, cid))
+        else:
+            self.sql.execute(
+                "UPDATE composition SET state=?, fail_reason=?, n_produced=? WHERE id=?",
+                (state, fail_reason, int(n_produced), cid))
         self.sql.commit()
+
+    def generation_yield(self) -> dict[str, int]:
+        """Requested versus produced across every composition that has run.
+
+        Reported by `csp status`, because a shortfall here is invisible further
+        down: the funnel narrows anyway, and 40% fewer candidates entering it
+        looks exactly like a campaign that was always going to be small.
+        """
+        row = self.sql.execute(
+            "SELECT COUNT(*) AS n, "
+            "       COALESCE(SUM(n_target), 0)   AS requested, "
+            "       COALESCE(SUM(n_produced), 0) AS produced, "
+            "       COALESCE(SUM(CASE WHEN n_produced < n_target THEN 1 ELSE 0 END), 0) AS short "
+            "FROM composition WHERE state IN ('generated','done')").fetchone()
+        return {"compositions": int(row["n"]), "requested": int(row["requested"]),
+                "produced": int(row["produced"]), "short": int(row["short"])}
 
     def chemsystems(self) -> list[str]:
         return [r["chemsys"] for r in self.sql.execute(
@@ -585,6 +618,44 @@ class Store:
         sets = ", ".join(f"{k}=?" for k in fields)
         self.sql.execute(f"UPDATE job SET {sets} WHERE id=?", [*fields.values(), job_id])
         self.sql.commit()
+
+    def orphan_jobs(self) -> int:
+        """Job rows written but never stamped with a scheduler id.
+
+        The driver writes its rows before submitting so that a process killed
+        mid-submission leaves evidence rather than nothing; this is how that
+        evidence is read back. A non-zero count means a job may be running that
+        no cycle will ever reconcile.
+        """
+        row = self.sql.execute(
+            "SELECT COUNT(*) AS n FROM job WHERE slurm_id='' AND state='pending'"
+        ).fetchone()
+        return int(row["n"])
+
+    def assert_job_id_is_new(self, slurm_id: str, stage: str, workdir: str) -> None:
+        """Refuse a scheduler id that already belongs to some other submission.
+
+        One array submission legitimately writes many job rows under a single
+        id -- that is how the funnel's chunked stages work -- so an id is not
+        unique by itself.  What must never happen is the *same* id naming two
+        different submissions, because reconciliation groups rows by id and
+        would then apply one job's outcome to the other's rows.
+
+        Real SLURM ids are globally unique, so this only ever fires for a local
+        run whose scheduler restarted its counter.  It is checked here anyway:
+        nothing downstream can tell a reused id from an array, and the failure
+        it produces is silent.
+        """
+        row = self.sql.execute(
+            "SELECT stage, workdir FROM job WHERE slurm_id=? AND "
+            "(stage!=? OR workdir!=?) LIMIT 1", (slurm_id, stage, workdir)).fetchone()
+        if row is not None:
+            raise StoreError(
+                f"scheduler id {slurm_id!r} is already recorded for stage "
+                f"{row['stage']!r} in {row['workdir']!r}; this submission is "
+                f"stage {stage!r} in {workdir!r}. Two submissions under one id "
+                f"would be reconciled against each other."
+            )
 
     def jobs(self, *, state: str | None = None, stage: str | None = None) -> list[sqlite3.Row]:
         q, args = "SELECT * FROM job WHERE 1=1", []

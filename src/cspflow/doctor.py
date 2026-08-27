@@ -325,6 +325,42 @@ def check_optional_deps(cfg: ResolvedConfig) -> Check:
                  "missing engines block only the stages that use them", rows)
 
 
+def check_generator(cfg: ResolvedConfig) -> Check:
+    """The generation checkpoint, checked from the login node.
+
+    Everything here is answerable without a GPU except the GPU itself, so the
+    device check is downgraded to a note: `csp doctor` normally runs on a login
+    node, where CUDA is legitimately absent. The array task repeats the same
+    preflight where it matters and refuses there.
+
+    The checks that do matter here are the ones nobody would think to make: that
+    the path is the run directory rather than the .ckpt file, and that Hydra
+    recorded `config_name: csp`. An unconditional checkpoint accepts
+    `--target_compositions`, ignores it, and returns structures of some other
+    chemistry -- which costs the whole job before anything notices.
+    """
+    if not cfg.campaign.needs_generation or cfg.campaign.generate is None:
+        return Check("generator", "skip", "no source mode generates structures")
+
+    try:
+        from .generators import for_config
+        engine = for_config(cfg.campaign.generate)
+    except Exception as exc:                                     # pragma: no cover
+        return Check("generator", "fail", f"could not build the generator: {exc}")
+
+    rows = [f"engine {cfg.campaign.generate.engine}", f"model  {engine.model}"]
+    device = engine.device()
+    rows.append(f"device {device}" + ("  (login node -- the job checks again)"
+                                      if device == "cpu" else ""))
+
+    problems = [p for p in engine.preflight() if "CUDA" not in p]
+    worst = "ok"
+    for problem in problems:
+        rows.append(problem)
+        worst = "fail" if "no checkpoints/" in problem or "not a directory" in problem else "warn"
+    return Check("generator", worst, "checkpoint layout and CSP training", rows)
+
+
 def check_paths(cfg: ResolvedConfig) -> Check:
     rows, worst = [], "ok"
     workdir = Path(cfg.campaign.workdir)
@@ -366,4 +402,5 @@ def run(cfg: ResolvedConfig, *, elements: list[str] | None = None, fix: bool = F
     report.add(check_qos_limits())
     report.add(check_throttle(cfg))
     report.add(check_optional_deps(cfg))
+    report.add(check_generator(cfg))
     return report

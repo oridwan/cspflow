@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import uuid
 from itertools import count
 from pathlib import Path
 
@@ -33,10 +34,17 @@ class LocalScheduler:
         self.machine = machine
         self.dry_run = dry_run
         self._ids = count(1)
+        # Job ids must be unique across *processes*, not merely within one.
+        # A counter alone restarts at 1 for every `csp run`, so the second
+        # invocation hands out `local-1` again -- and the job table then holds
+        # two unrelated jobs under one id, which reconciliation matches
+        # together. SLURM ids are globally unique and nothing else in the
+        # system knows that this one was not.
+        self._run = uuid.uuid4().hex[:8]
         self._statuses: dict[str, JobStatus] = {}
 
     def submit(self, spec: JobSpec) -> str:
-        job_id = f"local-{next(self._ids)}"
+        job_id = f"local-{self._run}-{next(self._ids)}"
         # Absolute: the job runs with cwd=workdir, so a path relative to the
         # campaign directory resolves to nothing once we are inside it.
         spec.workdir = spec.workdir.resolve()

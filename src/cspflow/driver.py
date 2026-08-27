@@ -61,6 +61,7 @@ class CycleReport:
     core_hours_spent: float = 0.0
     core_hours_projected: float = 0.0
     budget_exhausted: bool = False
+    orphans: int = 0
     note: str = ""
 
     @property
@@ -75,6 +76,10 @@ class CycleReport:
         for s in self.stages:
             if s.did_something or s.pending:
                 lines.append("  " + s.render())
+        if self.orphans:
+            lines.append(f"  WARNING: {self.orphans} job row(s) have no scheduler id. "
+                         f"A driver was killed while submitting; work may be running "
+                         f"untracked. See `csp status` and the stage workdir.")
         if self.budget_exhausted:
             lines.append("  BUDGET REACHED -- submitting nothing further")
         if self.note:
@@ -90,6 +95,18 @@ class DriverOptions:
     stages: Sequence[str] | None = None     # None = every registered stage
     dry_run: bool = False
     budget_core_hours: float | None = None
+
+
+def _estimate_tasks(stage: Stage, store: Store, budget: int) -> int:
+    """How many jobs `stage` would submit, without claiming anything.
+
+    Most stages submit one task per pending unit, so the default is the obvious
+    one; a stage that batches says so by implementing `estimate_tasks`.
+    """
+    estimate = getattr(stage, "estimate_tasks", None)
+    if estimate is not None:
+        return int(estimate(store, budget))
+    return min(stage.pending(store), budget)
 
 
 class Driver:
@@ -170,6 +187,12 @@ class Driver:
             return True
         if self.options.max_cycles is not None and n >= self.options.max_cycles:
             return True
+        if self.options.dry_run:
+            # A dry run claims nothing, so `pending` is the same next cycle and
+            # the loop below would never see the work run out: it slept a full
+            # interval and reprinted the identical report, forever, which reads
+            # as a hang rather than as a report. One cycle is the whole answer.
+            return True
         if report.budget_exhausted and report.in_flight == 0:
             self.emit("stopping: budget reached and nothing in flight")
             return True
@@ -184,6 +207,7 @@ class Driver:
         """Reconcile what is in flight, then submit what fits."""
         report = CycleReport(cycle=n)
 
+        report.orphans = self.store.orphan_jobs()
         report.reconciled = self._reconcile()
         spent, projected, in_flight = self._accounting()
         report.core_hours_spent = spent
@@ -355,9 +379,12 @@ class Driver:
 
         if self.options.dry_run:
             # Claiming marks rows in the database, so a dry run must not do it.
-            # The count is derivable without mutating anything.
-            out.note = (f"dry-run: would submit {min(pending, budget)} "
-                        f"({throttle.render()})")
+            # The count is derivable without mutating anything -- but `pending`
+            # and `budget` are not in the same units for every stage (screen
+            # counts structures and submits chunks; generate counts compositions
+            # and submits groups), so the stage is asked rather than assumed.
+            out.note = (f"dry-run: would submit {_estimate_tasks(stage, self.store, budget)} "
+                        f"task(s) ({throttle.render()})")
             return out
 
         items = stage.claim(self.store, budget)
@@ -370,14 +397,30 @@ class Driver:
         spec = stage.build(items, workdir)
         spec.array_throttle = spec.array_throttle or throttle.concurrent_tasks
 
-        job_id = self.scheduler.submit(spec)
-        self._claims[str(job_id)] = items
-        for item in items:
-            row = self.store.add_job(
+        # Rows first, then submit, then stamp the id on the rows.
+        #
+        # The obvious order -- submit, then record -- has a window in which the
+        # job is running and nothing in the database says so, and a driver that
+        # dies inside that window leaves work in the queue that no later cycle
+        # can find, reconcile, or cancel. Writing the rows first makes the worst
+        # case a row in `pending` with no scheduler id: visible in `csp status`,
+        # reported by the next cycle, and safe to act on by hand.
+        #
+        # (Found by killing a driver mid-submission: the structures were marked
+        # `screening`, the job script and manifest were on disk, the worker was
+        # running, and the job table held nothing at all.)
+        rows = [
+            self.store.add_job(
                 stage=stage.name,
                 structure_id=item.structure_ids[0] if item.structure_ids else None,
                 workdir=str(workdir),
             )
+            for item in items
+        ]
+        job_id = self.scheduler.submit(spec)
+        self.store.assert_job_id_is_new(str(job_id), stage.name, str(workdir))
+        self._claims[str(job_id)] = items
+        for row in rows:
             self.store.update_job(row, state="queued", slurm_id=str(job_id))
         out.submitted = len(items)
         out.note = throttle.render()

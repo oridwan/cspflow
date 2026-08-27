@@ -347,3 +347,32 @@ class TestLiveCluster:
         """Never `done`: assuming success for a job nobody remembers hides outages."""
         statuses = SlurmScheduler(orion).poll(["999999999"])
         assert statuses["999999999"].state is JobState.unknown
+
+
+# -- job identity across processes -----------------------------------------
+
+def test_local_job_ids_do_not_repeat_across_schedulers(tmp_path):
+    """A per-process counter hands out `local-1` again on the next `csp run`.
+
+    The job table then holds two unrelated submissions under one id, and
+    reconciliation -- which groups rows by id, because an array legitimately
+    shares one -- applies each job's outcome to the other's rows. Found by
+    running two stages in two `csp run` invocations and reading the table.
+    """
+    from cspflow.scheduler.local import LocalScheduler
+
+    first = LocalScheduler(dry_run=True)
+    second = LocalScheduler(dry_run=True)
+    a = first.submit(JobSpec(name="a", stage="generate", workdir=tmp_path, command="true"))
+    b = second.submit(JobSpec(name="b", stage="screen", workdir=tmp_path, command="true"))
+    assert a != b
+
+
+def test_ids_are_still_stable_within_one_scheduler(tmp_path):
+    from cspflow.scheduler.local import LocalScheduler
+
+    sched = LocalScheduler(dry_run=True)
+    ids = [sched.submit(JobSpec(name=f"j{i}", stage="s", workdir=tmp_path, command="true"))
+           for i in range(3)]
+    assert len(set(ids)) == 3
+    assert all(i.startswith("local-") for i in ids)

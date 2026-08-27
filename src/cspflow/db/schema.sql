@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS composition (
     z              INTEGER NOT NULL,          -- formula units
     n_atoms        INTEGER NOT NULL,          -- z * atoms per formula unit
     n_target       INTEGER NOT NULL DEFAULT 0,-- structures wanted
+    n_produced     INTEGER NOT NULL DEFAULT 0,-- structures the generator returned
     source_mode    TEXT    NOT NULL,
     source_name    TEXT    NOT NULL,
     state          TEXT    NOT NULL DEFAULT 'new'

@@ -408,3 +408,83 @@ class TestSourceStage:
         assert names == IMPLEMENTED
         assert set(names).isdisjoint(PLANNED)
         assert set(IMPLEMENTED) | set(PLANNED) == set(STAGE_ORDER)
+
+
+# -- dry runs --------------------------------------------------------------
+
+def test_a_dry_run_stops_after_one_cycle(cfg, store):
+    """A dry run claims nothing, so `pending` is identical next cycle.
+
+    Without this the loop never sees the work run out: it sleeps a whole
+    interval and reprints the same report, forever, which reads as a hang
+    rather than as a report. Found by running the command -- every unit test
+    passed `max_cycles`, which is exactly what masked it.
+    """
+    sched = FakeScheduler()
+    stage = FakeStage(work=6)
+    d = driver(cfg, store, sched, [stage], stages=["dft"], dry_run=True)
+    reports = d.run(watch=False)
+    assert len(reports) == 1
+    assert sched.submitted == []
+    assert stage.pending(store) == 6              # nothing was claimed
+
+
+def test_a_dry_run_counts_tasks_not_pending_units(cfg, store):
+    """`pending` and `budget` are in different units for a batching stage."""
+
+    class Batching(FakeStage):
+        name = "screen"
+
+        def estimate_tasks(self, store, budget):
+            return min(budget, (len(self.pool) + 499) // 500)
+
+    sched = FakeScheduler()
+    d = driver(cfg, store, sched, [Batching(work=1200)], stages=["screen"],
+               dry_run=True)
+    report = d.cycle(1)
+    screen = next(s for s in report.stages if s.stage == "screen")
+    assert "pending 1200" in screen.render()
+    assert "would submit 3 task(s)" in screen.note
+
+
+def test_without_estimate_tasks_the_count_is_one_per_pending_unit(cfg, store):
+    sched = FakeScheduler()
+    d = driver(cfg, store, sched, [FakeStage(work=3)], stages=["dft"], dry_run=True)
+    note = d.cycle(1).stages[0].note
+    assert "would submit 3 task(s)" in note
+
+
+# -- submitting is two writes, in the safe order ---------------------------
+
+def test_job_rows_exist_before_the_scheduler_is_called(cfg, store):
+    """Submit-then-record has a window where a job is running and nothing says
+    so; a driver killed inside it leaves work that no cycle can find.
+
+    Found by killing a driver mid-submission: the structures were marked
+    `screening`, the job script and manifest were on disk, the worker was
+    running, and the job table held nothing at all.
+    """
+    seen: dict[str, int] = {}
+
+    class Watching(FakeScheduler):
+        def submit(self, spec):
+            seen["rows_at_submit"] = len(store.jobs())
+            return super().submit(spec)
+
+    d = driver(cfg, store, Watching(), [FakeStage(work=2)], stages=["dft"],
+               max_cycles=1)
+    d.cycle(1)
+    assert seen["rows_at_submit"] == 2
+    assert all(j["slurm_id"] for j in store.jobs())
+
+
+def test_an_orphaned_row_is_reported_every_cycle(cfg, store):
+    row = store.add_job(stage="screen", workdir="/w")
+    assert store.orphan_jobs() == 1
+    d = driver(cfg, store, FakeScheduler(), [FakeStage(work=0)], stages=["dft"],
+               max_cycles=1)
+    report = d.cycle(1)
+    assert report.orphans == 1
+    assert "no scheduler id" in report.render()
+    store.update_job(row, state="queued", slurm_id="7")
+    assert store.orphan_jobs() == 0

@@ -19,7 +19,7 @@ from .driver import STAGE_ORDER, Driver, DriverError, DriverOptions
 from .scheduler import for_machine
 from .source import SourceError, expand_all, write_plan
 from .stages import IMPLEMENTED, PLANNED, build_registry
-from .worker import WorkerError, run_screen_task
+from .worker import WorkerError, run_generate_task, run_screen_task
 from .templates import scaffold
 
 app = typer.Typer(
@@ -375,6 +375,24 @@ def screen_worker(
     typer.echo(str(out))
 
 
+@app.command("generate-worker", hidden=True)
+def generate_worker(
+    manifest: Annotated[Path, typer.Option("--manifest", help="written by the generate stage")],
+    task_id: Annotated[Optional[int], typer.Option("--task-id", help="defaults to $SLURM_ARRAY_TASK_ID")] = None,
+) -> None:
+    """Generate structures for one chunk of a generate manifest.
+
+    Hidden for the same reason as `screen-worker`: it exists so that a SLURM
+    array task has something to invoke, and takes all of its instructions from
+    the manifest the stage wrote.
+    """
+    try:
+        out = run_generate_task(manifest, task_id)
+    except WorkerError as exc:
+        _die(str(exc))
+    typer.echo(str(out))
+
+
 @app.command()
 def status(
     campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
@@ -395,6 +413,17 @@ def status(
         typer.echo(f"campaign     {s['campaign']}")
         typer.echo(f"database     {db}")
         typer.echo(f"compositions {s['compositions']}  across {s['chemsystems']} chemical systems")
+        # Generation yield is reported before the structure counts because a
+        # shortfall here is invisible below it: the funnel narrows anyway, and
+        # 40% fewer candidates entering it looks exactly like a smaller campaign.
+        gen = store.generation_yield()
+        if gen["compositions"]:
+            pct = 100.0 * gen["produced"] / gen["requested"] if gen["requested"] else 0.0
+            line = (f"generated    {gen['produced']:,} of {gen['requested']:,} "
+                    f"requested ({pct:.1f}%)")
+            if gen["short"]:
+                line += f"   <- {gen['short']} composition(s) short"
+            typer.echo(line)
         typer.echo(f"structures   {s['structures']}")
         for state, n in sorted(s["structures_by_state"].items()):
             typer.echo(f"    {state:<16} {n}")

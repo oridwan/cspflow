@@ -52,6 +52,12 @@ class ScreenStage:
     def pending(self, store: Store) -> int:
         return store.count_structures(state=StructureState.new.value)
 
+    def estimate_tasks(self, store: Store, budget: int) -> int:
+        """`budget` is in array tasks; `pending` is in structures."""
+        import math
+
+        return min(budget, math.ceil(self.pending(store) / self.chunk))
+
     def claim(self, store: Store, budget: int) -> list[WorkItem]:
         """Take up to `budget` structures and mark them `screening`.
 

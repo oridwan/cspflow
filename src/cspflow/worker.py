@@ -91,6 +91,72 @@ def run_screen_task(manifest_path: str | Path, task_id: int | None = None) -> Pa
     return out
 
 
+def run_generate_task(manifest_path: str | Path, task_id: int | None = None) -> Path:
+    """Generate structures for one chunk of compositions and write its results.
+
+    The chunk is a group of compositions that all want the same number of
+    structures, so the whole chunk is one MatterGen call (or two, when the count
+    exceeds the batch cap).  The checkpoint is therefore loaded once for the
+    task rather than once per composition.
+
+    Preflight runs *before* the model is touched.  The check that matters most
+    is CUDA: MatterGen's `get_device()` returns CPU when no GPU is visible and
+    logs nothing, so a task that landed on the wrong partition would sample at
+    roughly a thousandth of the intended rate and be killed by its walltime,
+    leaving a TIMEOUT with no cause anywhere in the logs.
+    """
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise WorkerError(f"manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+
+    if task_id is None:
+        task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
+    chunks = manifest["chunks"]
+    if not 0 <= task_id < len(chunks):
+        raise WorkerError(
+            f"array task {task_id} has no chunk in {manifest_path} "
+            f"({len(chunks)} chunk(s)). Was --array sized to match the manifest?")
+    chunk = chunks[task_id]
+
+    from .chem import parse_formula
+    from .generators import GenerationRequest, MatterGenEngine
+
+    engine = MatterGenEngine(
+        model=manifest["model"], mode=manifest.get("mode", "csp"),
+        max_batch_size=int(manifest.get("max_batch_size", 100)),
+        timeout_per_batch=int(manifest.get("timeout_per_batch", 1800)),
+    )
+    problems = engine.preflight()
+    if problems:
+        raise WorkerError("generation preflight failed:\n  - " + "\n  - ".join(problems))
+
+    requests = []
+    for entry in chunk:
+        per_fu = parse_formula(entry["formula"])
+        counts = {element: count * int(entry["z"]) for element, count in per_fu.items()}
+        if sum(counts.values()) != int(entry["n_atoms"]):
+            raise WorkerError(
+                f"{entry['formula']} Z={entry['z']} is {sum(counts.values())} atoms "
+                f"but the composition row says {entry['n_atoms']}")
+        requests.append(GenerationRequest(
+            composition_id=int(entry["id"]), formula=entry["formula"],
+            counts=counts, n_requested=int(entry["n_requested"])))
+
+    key = manifest.get("key") or manifest_path.name.split(".manifest")[0]
+    task_dir = manifest_path.parent / f"{key}.task{task_id}.out"
+    outcomes = engine.generate_many(requests, task_dir)
+
+    out = manifest_path.parent / f"{key}.task{task_id}.json"
+    _atomic_write_json(out, {
+        "task_id": task_id,
+        "engine": engine.name,
+        "model": engine.model,
+        "results": [o.as_dict() for o in outcomes],
+    })
+    return out
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Write to a temporary name, then rename.
 
