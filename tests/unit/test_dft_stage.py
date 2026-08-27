@@ -15,7 +15,9 @@ from ase.build import bulk
 from cspflow.config.loader import load_campaign
 from cspflow.db.store import Origin, Store, StructureState
 from cspflow.scheduler.base import JobState, JobStatus
-from cspflow.stages.dft_stage import ATTEMPT_KEY, STEP_KEY, DftStage
+from cspflow.dft.vasp.inputs import InputError
+from cspflow.stages.dft_stage import (ATTEMPT_KEY, DIR_KEY, STEP_KEY,
+                                      DftStage)
 
 MACHINES = Path(__file__).resolve().parents[2] / "src" / "cspflow" / "machines"
 POTCARS = Path("/projects/mmi/Ridwan/potcarFiles/pmg")
@@ -407,7 +409,7 @@ class TestArchivingAndResuming:
         stage.build(second, workdir)
 
         assert (directory / "attempt-0" / "OUTCAR").is_file()
-        assert second[0].payload["resumed_from"].endswith("attempt-0/CONTCAR")
+        assert second[0].payload["started_from"].endswith("attempt-0/CONTCAR")
         written = ase.io.read(str(directory / "POSCAR"), format="vasp")
         assert written.get_volume() == pytest.approx(moved.get_volume(), rel=1e-6)
         assert "NSW = 200" in (directory / "INCAR").read_text()
@@ -532,3 +534,60 @@ class TestOptionsThatDidNothing:
         cfg.campaign.dft.select.max_total = 1
         ready = DftStage(cfg)._ready(store)
         assert [int(r.id) for r in ready] == [ids[2]]
+
+
+class TestTheNextStepStartsFromTheRelaxedGeometry:
+    """`static` exists to give a high-accuracy energy AT THE RELAXED GEOMETRY,
+    and its energy is what goes onto the DFT hull.
+
+    Started from the structure in the database it runs on the generated cell
+    instead and reports a number that looks entirely plausible and is wrong by
+    whatever the relaxation was worth. Measured live before the fix: static
+    POSCARs at 176.15, 172.92 and 260.70 A^3 against relax CONTCARs at 179.03,
+    179.71 and 260.84.
+    """
+
+    @has_potcars
+    def test_the_static_step_uses_the_relax_contcar(self, cfg, store, tmp_path):
+        import ase.io
+
+        [sid] = add_selected(store, 1)
+        stage = DftStage(cfg)
+        workdir = tmp_path / "dft"
+
+        relax_items = stage.claim(store, budget=1)
+        stage.build(relax_items, workdir)
+        relax_dir = workdir / relax_items[0].key
+        relaxed = ase.io.read(str(relax_dir / "POSCAR"), format="vasp")
+        relaxed.set_cell(relaxed.get_cell() * 1.04, scale_atoms=True)
+        ase.io.write(str(relax_dir / "CONTCAR"), relaxed, format="vasp")
+
+        outcome = type("O", (), {"energy": -1.0, "e_per_atom": -0.5,
+                                 "magnetisation": None})()
+        stage._advance(store, sid, step=0, outcome=outcome, directory=relax_dir)
+
+        static_items = stage.claim(store, budget=1)
+        assert static_items[0].payload["step_name"] == "static"
+        stage.build(static_items, workdir)
+        written = ase.io.read(str(workdir / static_items[0].key / "POSCAR"),
+                              format="vasp")
+        assert written.get_volume() == pytest.approx(relaxed.get_volume(), rel=1e-6)
+        assert static_items[0].payload["started_from"].endswith("CONTCAR")
+
+    @has_potcars
+    def test_a_missing_contcar_refuses_rather_than_using_the_generated_cell(
+            self, cfg, store, tmp_path):
+        """Silently falling back is exactly the failure this guards."""
+        [sid] = add_selected(store, 1)
+        store.set_structure_state(sid, StructureState.selected,
+                                  **{STEP_KEY: 1, DIR_KEY: str(tmp_path / "gone")})
+        stage = DftStage(cfg)
+        items = stage.claim(store, budget=1)
+        with pytest.raises(InputError, match="unrelaxed geometry"):
+            stage.build(items, tmp_path / "dft")
+
+    def test_the_first_step_needs_no_previous_geometry(self, cfg, store, tmp_path):
+        [sid] = add_selected(store, 1)
+        items = DftStage(cfg).claim(store, budget=1)
+        assert items[0].payload["step"] == 0
+        assert "started_from" not in items[0].payload

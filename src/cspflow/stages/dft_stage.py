@@ -236,15 +236,41 @@ class DftStage:
 
         store = _Store.open(self.cfg.campaign_db)
         try:
-            atoms = store.get_structure(item.structure_ids[0]).toatoms()
+            row = store.get_structure(item.structure_ids[0])
+            atoms = row.toatoms()
+            previous_dir = row.key_value_pairs.get(DIR_KEY)
         finally:
             store.close()
 
+        # Where this step starts from, in order of preference.
+        #
+        # 1. A retry that asked to resume picks up its own previous attempt.
+        # 2. Otherwise a step after the first starts from the *previous step's*
+        #    CONTCAR. This is the one that matters most: `static` exists to give
+        #    a high-accuracy energy AT THE RELAXED GEOMETRY, and its energy is
+        #    what goes onto the DFT hull. Started from the structure in the
+        #    database it runs on the generated cell instead, and reports a
+        #    number that looks entirely plausible and is wrong by whatever the
+        #    relaxation was worth. Measured live before the fix: 176.15 vs
+        #    179.03 A^3, 172.92 vs 179.71, 260.70 vs 260.84.
+        # 3. Otherwise the structure as generated.
+        source = None
         if item.payload.get("remedy") == "resume_from_contcar" and archived:
-            resumed = _read_contcar(archived / "CONTCAR")
-            if resumed is not None:
-                atoms = resumed
-                item.payload["resumed_from"] = str(archived / "CONTCAR")
+            source = archived / "CONTCAR"
+        elif int(item.payload.get("step", 0)) > 0 and previous_dir:
+            source = Path(previous_dir) / "CONTCAR"
+
+        if source is not None:
+            carried = _read_contcar(source)
+            if carried is not None:
+                atoms = carried
+                item.payload["started_from"] = str(source)
+            elif int(item.payload.get("step", 0)) > 0:
+                raise InputError(
+                    f"structure {item.structure_ids[0]} is at recipe step "
+                    f"{item.payload['step']} but {source} is missing or empty. "
+                    f"Running this step on the unrelaxed geometry would produce "
+                    f"a plausible energy at the wrong structure.")
 
         stage = self.recipe.stages[item.payload["step"]]
         overrides = item.payload.get("incar_overrides") or {}
