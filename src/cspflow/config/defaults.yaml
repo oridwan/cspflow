@@ -1,0 +1,9 @@
+# cspflow shipped defaults.
+#
+# Deliberately almost empty.  The pydantic models in schema.py are the single
+# source of truth for defaults; duplicating them here would create two places to
+# change and one of them would eventually be wrong.  `csp config defaults`
+# prints the full effective default set derived from the schema.
+#
+# Only put a value here if it genuinely has no sensible schema-level default --
+# i.e. it depends on the installation rather than on the physics.

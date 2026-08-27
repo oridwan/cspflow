@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cspflow"
+version = "0.1.0.dev0"
+description = "End-to-end high-throughput crystal structure prediction and first-principles discovery pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Ridwan"}]
+keywords = ["crystal-structure-prediction", "high-throughput", "DFT", "materials-discovery", "VASP"]
+
+dependencies = [
+    "pydantic>=2.5",
+    "PyYAML>=6.0",
+    "typer>=0.9",
+    "ase>=3.22",
+    "numpy>=1.24",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+full = ["pymatgen>=2023.9", "pyxtal>=1.0", "scipy>=1.10"]
+dev  = ["pytest>=7.4", "pytest-cov", "ruff"]
+
+[project.scripts]
+csp = "cspflow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cspflow = ["config/*.yaml", "machines/*.yaml", "db/*.sql", "dft/recipes/*.yaml", "templates/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cluster: needs a live SLURM scheduler",
+    "network: needs outbound network (MP API)",
+    "gpu: needs a GPU",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

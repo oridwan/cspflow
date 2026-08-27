@@ -1,0 +1,57 @@
+# UNC Charlotte research cluster.
+# Partitions verified live 2026-08-26 via `sinfo`:
+#   Orion (118 nodes) | Apus (11) | Nebula (13) | GPU (14) | Nebula_GPU (8)
+#   Hydrus (1) | DTN (2)
+scheduler: slurm
+
+partitions:
+  cpu:        {name: "Orion,Apus"}
+  gpu:        {name: "GPU"}
+  bigmem:     {name: "Hydrus"}
+  short:      {name: "Nebula"}
+  short_gpu:  {name: "Nebula_GPU"}
+
+defaults:
+  nodes: 1
+  ntasks: 16
+  cpus_per_task: 1
+  mem: 32G
+
+# Starting points only -- `csp doctor` re-reads the live limits from sacctmgr
+# and scontrol, and the driver throttles against what it finds, not against
+# what is written here.
+limits:
+  cpu:  {max_submit: 2048, max_cpus: 768, max_walltime: "30-00:00:00"}
+  gpu:  {max_submit: 128,  max_gpus: 12,  max_walltime: "30-00:00:00"}
+  short: {max_walltime: "2-00:00:00"}
+
+modules:
+  cpu: [intel/mkl/2024.0, intel/2024, intel-mpi/2021.11]
+  gpu: [cuda/11.8]
+
+env:
+  OMP_NUM_THREADS: 1
+  I_MPI_FABRICS: "shm:ofi"
+
+# Your installation, not Shuo's.
+codes:
+  vasp_std: /projects/mmi/Ridwan/potcarFiles/VASP6.4/vasp.6.4.3/bin/vasp_std
+  mpi_launcher: "srun --mpi=pmi2"
+
+# pymatgen expects functional labels to map to specific directory NAMES, which
+# the raw potpaw_PBE trees do not use.  `csp doctor --fix` creates this
+# symlink layout; without it `functional: PBE_64` silently falls back to a
+# flat-layout match and the label misdescribes what is actually on disk.
+potcar_root: /projects/mmi/Ridwan/potcarFiles/pmg
+potcar_dirs:
+  PBE_64: POT_PAW_PBE_64          # -> VASP6.4/potpaw_PBE
+  PBE_52: POT_GGA_PAW_PBE_52      # -> VASP5.2/potpaw_PBE
+potcar_trees:
+  VASP6.4: PBE_64
+  VASP5.2: PBE_52
+
+conda:
+  cpu: base
+  gpu: mattersim
+
+scratch: /scratch/$USER

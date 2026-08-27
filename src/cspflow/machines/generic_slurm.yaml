@@ -1,0 +1,29 @@
+# Portable fallback: only options every SLURM site understands.
+# No partition names, no site modules, no --exclude.  Runs anywhere out of the
+# box; tune by copying this file and adding site specifics.
+scheduler: slurm
+
+partitions:
+  cpu: {name: ""}     # empty -> omit --partition, let the site default apply
+  gpu: {name: ""}
+
+defaults:
+  nodes: 1
+  ntasks: 8
+  cpus_per_task: 1
+  mem: 16G
+
+limits: {}
+modules: {}
+env:
+  OMP_NUM_THREADS: 1
+
+codes:
+  vasp_std: vasp_std          # resolved from $PATH
+  mpi_launcher: "srun"
+
+potcar_root: null             # from $PMG_VASP_PSP_DIR
+potcar_dirs: {}
+potcar_trees: {}
+conda: {}
+scratch: /tmp/$USER

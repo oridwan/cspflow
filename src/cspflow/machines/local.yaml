@@ -1,0 +1,8 @@
+# No scheduler: run stages in-process.  For tests and small experiments.
+scheduler: local
+partitions:
+  cpu: {name: ""}
+  gpu: {name: ""}
+defaults: {nodes: 1, ntasks: 1, cpus_per_task: 1, mem: 4G}
+codes: {mpi_launcher: ""}
+scratch: /tmp/$USER
