@@ -241,6 +241,72 @@ def check_qos_limits() -> Check:
                  ["Account|Partition|QOS|MaxSubmit|MaxJobs|GrpTRES", *rows[:12]])
 
 
+def check_throttle(cfg: ResolvedConfig) -> Check:
+    """Compare the configured submission limits against the live QOS.
+
+    The plan asks for this explicitly (pipeline.md sec.4.5), and the reason is
+    a real event: `redo-new-ter-mag` submitted **2,362 individual jobs** against
+    a `MaxSubmitJobsPU` of 2,048. Submitting past the cap does not queue the
+    excess -- it is refused, and by then the driver believes it has dispatched
+    work it has not.
+
+    The subtler number is the concurrency one. `MaxTRESPU cpu=768` at
+    `ntasks=16` means **48 VASP jobs can run at once**, no matter how many are
+    queued. A `max_concurrent_tasks` above that is not faster; it just makes the
+    `%N` array throttle a lie.
+    """
+    from .scheduler import compute_throttle, for_machine
+
+    machine = cfg.machine
+    if machine.scheduler != "slurm":
+        return Check("throttle", "skip", f"scheduler is {machine.scheduler!r}")
+
+    scheduler = for_machine(machine)
+    rows, worst = [], "ok"
+
+    # Only `dft` has configured throttles; the GPU stages are bound by the
+    # gres cap and are reported so the ceiling is visible, not because the user
+    # chose a number that could be wrong.
+    dft_cfg = cfg.campaign.dft
+    plans = [
+        ("dft", "cpu", dft_cfg.max_in_flight, dft_cfg.max_concurrent_tasks,
+         machine.defaults.ntasks, 0),
+    ]
+    for stage, res in (("generate", cfg.campaign.generate.resources if cfg.campaign.generate else None),
+                       ("screen", cfg.campaign.screen.resources)):
+        if res is None:
+            continue
+        plans.append((stage, res.role, dft_cfg.max_in_flight, dft_cfg.max_in_flight,
+                      res.ntasks or 1, res.gpus or 0))
+
+    for stage, role, want_flight, want_concurrent, ntasks, gpus in plans:
+        try:
+            limits = scheduler.limits(role)
+        except Exception as exc:                        # pragma: no cover - live only
+            rows.append(f"{stage:<8} could not read limits for role {role!r}: {exc}")
+            worst = "warn"
+            continue
+
+        throttle = compute_throttle(
+            requested_in_flight=want_flight, requested_concurrent=want_concurrent,
+            ntasks=ntasks, gpus_per_job=gpus, limits=limits,
+        )
+        clamped = (throttle.in_flight < want_flight
+                   or throttle.concurrent_tasks < want_concurrent)
+        rows.append(
+            f"{stage:<8} role={role:<4} asked {want_flight}/{want_concurrent}  "
+            f"-> {throttle.render()}"
+        )
+        if limits.source == "live":
+            rows.append(f"         (no QOS found for role {role!r}; limits unknown)")
+            worst = "warn" if worst == "ok" else worst
+        elif clamped:
+            worst = "warn" if worst == "ok" else worst
+
+    return Check("throttle", worst,
+                 "configured limits vs. what the QOS actually permits", rows)
+
+
 def check_optional_deps(cfg: ResolvedConfig) -> Check:
     """Engines are only needed if the campaign actually uses them."""
     wanted: dict[str, str] = {}
@@ -298,5 +364,6 @@ def run(cfg: ResolvedConfig, *, elements: list[str] | None = None, fix: bool = F
     report.add(check_vasp(cfg.machine))
     report.add(check_scheduler(cfg.machine))
     report.add(check_qos_limits())
+    report.add(check_throttle(cfg))
     report.add(check_optional_deps(cfg))
     return report
