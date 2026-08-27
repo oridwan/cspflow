@@ -6,6 +6,7 @@ quietly becoming a literal one.
 """
 
 import pytest
+from ase import Atoms
 from ase.build import bulk
 
 from cspflow.config.loader import load_campaign
@@ -27,10 +28,17 @@ filter:
 """
 
 
-def make_cfg(tmp_path, source="literal"):
+def make_cfg(tmp_path, source="literal", filter_block=None):
     (tmp_path / "seeds").mkdir(exist_ok=True)
-    path = tmp_path / f"campaign-{source}.yaml"
-    path.write_text(CAMPAIGN.format(workdir=tmp_path, source=source))
+    if filter_block is None:
+        text = CAMPAIGN.format(workdir=tmp_path, source=source)
+        name = f"campaign-{source}.yaml"
+    else:
+        head = CAMPAIGN.format(workdir=tmp_path, source=source).split("filter:")[0]
+        text = head + filter_block + "\n"
+        name = f"campaign-{abs(hash(filter_block)) % 10**8}.yaml"
+    path = tmp_path / name
+    path.write_text(text)
     return load_campaign(path)
 
 
@@ -180,3 +188,53 @@ class TestPlumbing:
 
         assert STAGE_ORDER.index("calibrate") < STAGE_ORDER.index("filter")
         assert STAGE_ORDER.index("filter") < STAGE_ORDER.index("dft")
+
+
+# -- the spacegroup floor --------------------------------------------------
+
+class TestSpacegroupFloor:
+    """`spacegroup: {min_number: 3}` is in the shipped template and was read by
+    nothing: a campaign asking to drop P1 and P-1 got no filtering and no
+    warning. Generated structures are P1 by construction, so this is the gate
+    most likely to be set and most likely to matter."""
+
+    def test_a_low_symmetry_structure_is_dropped(self, tmp_path):
+        cfg = make_cfg(tmp_path, filter_block="filter: {e_above_hull_max: 1.0, spacegroup: {min_number: 3}}")
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            triclinic = Atoms("Fe2", positions=[(0, 0, 0), (1.1, 1.3, 1.7)],
+                              cell=[[3.1, 0.2, 0.1], [0.3, 3.3, 0.2], [0.1, 0.4, 3.5]],
+                              pbc=True)
+            sid = add(store, triclinic, 0.01)
+            store.update_structure(sid, spacegroup=1)
+            FilterStage(cfg).run(store)
+            row = store.get_structure(sid)
+            assert row.key_value_pairs["state"] == "filtered_out"
+            gates = {e["gate"]: e for e in store.filter_events(sid)}
+            assert gates["filter:spacegroup"]["passed"] == 0
+
+    def test_a_symmetric_structure_survives(self, tmp_path):
+        cfg = make_cfg(tmp_path, filter_block="filter: {e_above_hull_max: 1.0, spacegroup: {min_number: 3}}")
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            sid = add(store, bulk("Fe", "bcc", a=2.87, cubic=True), 0.01)
+            store.update_structure(sid, spacegroup=229)
+            FilterStage(cfg).run(store)
+            assert store.get_structure(sid).key_value_pairs["state"] == "selected"
+
+    def test_the_default_floor_filters_nothing(self, tmp_path):
+        """`min_number: 1` is every spacegroup, so the gate must not run at
+        all -- computing symmetry for every candidate to reject none of them is
+        a cost with no purpose."""
+        cfg = make_cfg(tmp_path, filter_block="filter: {e_above_hull_max: 1.0}")
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            sid = add(store, bulk("Fe", "bcc", a=2.87, cubic=True), 0.01)
+            FilterStage(cfg).run(store)
+            assert not any(e["gate"] == "filter:spacegroup"
+                           for e in store.filter_events(sid))
+
+    def test_symmetry_is_computed_when_analyze_has_not_run(self, tmp_path):
+        """The filter runs before any DFT, so the number is not on the row."""
+        cfg = make_cfg(tmp_path, filter_block="filter: {e_above_hull_max: 1.0, spacegroup: {min_number: 3}}")
+        with Store.create(tmp_path / "c.db", campaign="t") as store:
+            sid = add(store, bulk("Fe", "bcc", a=2.87, cubic=True), 0.01)
+            FilterStage(cfg).run(store)
+            assert store.get_structure(sid).key_value_pairs["state"] == "selected"

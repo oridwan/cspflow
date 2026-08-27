@@ -30,6 +30,19 @@ from ..db.store import Store, StructureState
 from .base import StageReport
 
 
+def _spacegroup_of(row) -> int | None:
+    """Symmetry for a structure `analyze` has not looked at yet.
+
+    The filter runs before any DFT, so the number is not on the row; it is
+    computed here at the same tolerance `analyze` uses and cached, so a campaign
+    that filters on symmetry does not pay for it twice.
+    """
+    from ..analysis.properties import SPACEGROUP_SYMPREC, spacegroup_of
+
+    number, _ = spacegroup_of(row.toatoms(), SPACEGROUP_SYMPREC)
+    return number
+
+
 class FilterStage:
     name = "filter"
     role = "cpu"
@@ -76,7 +89,43 @@ class FilterStage:
                 store.set_structure_state(int(row.id), StructureState.filtered_out,
                                           filter_reason="above the hull threshold")
 
-        # 2. The per-composition cap, applied to what survived the cut.
+        above_hull = len(rows) - len(survivors)
+
+        # 2. The spacegroup floor, before the cap.
+        #
+        # `spacegroup: {min_number: 3}` is in the shipped template and was read
+        # by nothing: a campaign asking to drop P1 and P-1 got no filtering and
+        # no warning. Generated structures are P1 by construction, so this is
+        # the gate most likely to be set and most likely to matter.
+        floor = cfg.spacegroup.min_number
+        dropped_symmetry = 0
+        if floor > 1:
+            kept = []
+            for row, e_hull in survivors:
+                number = row.key_value_pairs.get("spacegroup")
+                if number is None:
+                    number = _spacegroup_of(row)
+                passed = number is not None and int(number) >= floor
+                store.add_filter_event(
+                    structure_id=int(row.id), gate="filter:spacegroup",
+                    passed=passed,
+                    value=float(number) if number is not None else None,
+                    threshold=float(floor),
+                    detail="" if passed else (
+                        f"spacegroup {number} is below the floor {floor}"
+                        if number is not None else
+                        "symmetry could not be determined"),
+                )
+                if passed:
+                    kept.append((row, e_hull))
+                else:
+                    store.set_structure_state(
+                        int(row.id), StructureState.filtered_out,
+                        filter_reason=f"spacegroup < {floor}")
+                    dropped_symmetry += 1
+            survivors = kept
+
+        # 3. The per-composition cap, applied to what survived the cut.
         by_composition: dict[str, list] = defaultdict(list)
         for row, e_hull in survivors:
             by_composition[row.toatoms().get_chemical_formula()].append((row, e_hull))
@@ -103,8 +152,10 @@ class FilterStage:
                     capped += 1
 
         note = (f"threshold {threshold:.4f} eV/atom ({how}); "
-                f"{selected} selected, {len(rows) - len(survivors)} above the hull, "
+                f"{selected} selected, {above_hull} above the hull, "
                 f"{capped} over the per-composition cap")
+        if dropped_symmetry:
+            note += f", {dropped_symmetry} below spacegroup {floor}"
         return StageReport(stage=self.name, claimed=selected,
                            reconciled=len(rows), note=note)
 

@@ -194,14 +194,25 @@ def read_job_directory(directory: Path) -> JobOutcome:
     oszicar = read_oszicar(directory / "OSZICAR")
     incar = read_incar(directory / "INCAR")
     nsw = incar_int(incar, "NSW")
+    ibrion = incar_int(incar, "IBRION")
     n_atoms = outcar.n_atoms
+
+    # A step with no ionic motion has no force criterion to reach, so VASP never
+    # prints "reached required accuracy" and `outcar.converged` is always False.
+    # Judged by the relax step's rule, a perfectly good static calculation is
+    # therefore "not converged" -- and the retry ladder fires on it forever.
+    #
+    # Found live: a `static` step reported 200 ionic steps and converged=False,
+    # having been retried once already.
+    static = (nsw is not None and nsw <= 0) or ibrion == -1
+    converged = outcar.converged or (static and outcar.finished)
 
     if not outcar.exists:
         state, reason = "failed", "no OUTCAR"
     elif not outcar.finished:
         # No epilogue: the process was killed. Walltime is the usual cause.
         state, reason = "timeout", "OUTCAR has no epilogue (killed mid-run)"
-    elif outcar.converged:
+    elif converged:
         state, reason = "done", ""
     elif nsw is not None and oszicar.n_ionic_steps >= nsw:
         state, reason = "done", "ionic_step_limit"
@@ -220,7 +231,7 @@ def read_job_directory(directory: Path) -> JobOutcome:
     return JobOutcome(
         path=directory,
         state=state,
-        converged=outcar.converged,
+        converged=converged,
         n_ionic_steps=oszicar.n_ionic_steps,
         step_limit=nsw,
         energy=oszicar.e0,

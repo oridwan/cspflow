@@ -62,9 +62,15 @@ def run_screen_task(manifest_path: str | Path, task_id: int | None = None) -> Pa
         max_steps=int(manifest.get("max_steps", 500)),
     )
 
+    # Structures the campaign asked not to move. A single point still gives the
+    # energy the hull needs; what it does not do is change a geometry the user
+    # supplied deliberately.
+    single_point = set(manifest.get("single_point") or [])
+
     results: list[dict[str, Any]] = []
     for sid, atoms in structures:
-        result = engine.relax(atoms)
+        result = (engine.single_point(atoms) if sid in single_point
+                  else engine.relax(atoms))
         results.append({
             "structure_id": sid,
             "energy": result.energy,
@@ -77,6 +83,7 @@ def run_screen_task(manifest_path: str | Path, task_id: int | None = None) -> Pa
             "volume_drift": result.volume_drift,
             "error": result.error,
             "engine": result.engine,
+            "relaxed": sid not in single_point,
         })
 
     key = manifest.get("key") or manifest_path.name.split(".manifest")[0]

@@ -332,3 +332,61 @@ class TestMatterSimEngine:
         bad.positions[1] = bad.positions[0] + [0.05, 0.0, 0.0]
         _, stats = engine.relax_with_stats([bulk("Fe", "bcc", a=3.10, cubic=True), bad])
         assert stats.total == 2 and stats.rejected == 1 and stats.converged == 1
+
+
+@pytest.fixture
+def empty_store(tmp_path):
+    store = Store.create(tmp_path / "seeds.db", campaign="t")
+    yield store
+    store.close()
+
+
+def _screen(cfg):
+    from cspflow.stages import ScreenStage
+
+    return ScreenStage(cfg)
+
+
+class TestSeedsThatMustNotMove:
+    """`structure_list.relax: false` -- "MLIP-relax the seed before DFT" -- was
+    written onto the structure as `needs_relax` and read by nothing, so a seed
+    the user supplied deliberately was relaxed anyway. Mode 3's control-group
+    use depends on this: a prototype compared against its own relaxed form is
+    not a control if both were relaxed.
+    """
+
+    def test_the_claim_marks_which_structures_must_not_move(self, cfg, empty_store):
+        moving = empty_store.add_structure(bulk("Fe", "bcc", a=2.87, cubic=True),
+                                     origin=Origin.seed, needs_relax=True)
+        fixed = empty_store.add_structure(bulk("Fe", "bcc", a=2.90, cubic=True),
+                                    origin=Origin.seed, needs_relax=False)
+        items = _screen(cfg).claim(empty_store, budget=1)
+        flagged = {sid for item in items for sid in item.payload["single_point"]}
+        assert flagged == {fixed}
+        assert moving not in flagged
+
+    def test_the_manifest_carries_it(self, cfg, empty_store, tmp_path):
+        fixed = empty_store.add_structure(bulk("Fe", "bcc", a=2.90, cubic=True),
+                                    origin=Origin.seed, needs_relax=False)
+        stage = _screen(cfg)
+        items = stage.claim(empty_store, budget=1)
+        stage.build(items, tmp_path)
+        manifest = json.loads(next(tmp_path.glob("*.manifest.json")).read_text())
+        assert manifest["single_point"] == [fixed]
+
+    def test_a_normal_structure_is_not_flagged(self, cfg, empty_store):
+        empty_store.add_structure(bulk("Fe", "bcc", a=2.87, cubic=True),
+                            origin=Origin.generated)
+        items = _screen(cfg).claim(empty_store, budget=1)
+        assert items[0].payload["single_point"] == []
+
+    def test_the_result_records_which_it_was(self, cfg, empty_store):
+        """`mlip_relaxed=False` so nothing downstream reads a single-point
+        energy as a relaxed one."""
+        sid = empty_store.add_structure(bulk("Fe", "bcc", a=2.90, cubic=True),
+                                  origin=Origin.seed, needs_relax=False)
+        stage = _screen(cfg)
+        stage._absorb(empty_store, {"max_steps": 300, "results": [
+            {"structure_id": sid, "e_per_atom": -8.0, "converged": True,
+             "n_steps": 0, "relaxed": False, "energy": -16.0}]})
+        assert empty_store.get_structure(sid).key_value_pairs["mlip_relaxed"] is False

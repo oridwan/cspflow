@@ -103,6 +103,14 @@ def reconstruct(tm_moment: float, re_counts: dict[str, int], *,
     result = Reconstruction(m_s=float(tm_moment), tm_moment=float(tm_moment),
                             f_treatment=f_treatment)
 
+    if f_treatment == "no_reconstruction":
+        result.warnings.append(
+            "reconstruct_ms is off: m_s_reconstructed is the transition-metal "
+            "sublattice moment with no 4f term added. For a heavy rare earth "
+            "that is not the saturation magnetisation -- read m_dft_raw and "
+            "know what it omits.")
+        return result
+
     if f_treatment != "frozen":
         result.warnings.append(
             f"f_treatment={f_treatment!r}: the 4f moment is already in the DFT "

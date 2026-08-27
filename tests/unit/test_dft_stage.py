@@ -441,3 +441,94 @@ def test_no_archive_at_all_is_none(tmp_path):
     d = tmp_path / "job"
     d.mkdir()
     assert _latest_archive(d) is None
+
+
+class TestOptionsThatDidNothing:
+    """Four documented options were in the schema and the shipped template and
+    read by no code at all. Same family as B29: a value recorded and never
+    applied is worse than an absent one, because the config file says it works.
+    """
+
+    def test_a_static_step_is_not_judged_by_the_force_criterion(self, tmp_path):
+        """VASP never prints "reached required accuracy" for IBRION=-1, NSW=0,
+        so a static run was always "not converged" and the ladder retried it.
+
+        Found live: a static step reported 200 ionic steps, having inherited
+        NSW=200 from the relax step's remedy and been retried once.
+        """
+        from cspflow.dft.vasp.parse import read_job_directory
+
+        d = tmp_path / "static"
+        d.mkdir()
+        (d / "INCAR").write_text("IBRION = -1\nNSW = 0\n")
+        (d / "OUTCAR").write_text(
+            "   NIONS =      2\n"
+            " General timing and accounting informations for this job:\n"
+            "                         Elapsed time (sec):     10.0\n")
+        (d / "OSZICAR").write_text("   1 F= -.20E+02 E0= -.20E+02  d E =0.0  mag=  1.0\n")
+        outcome = read_job_directory(d)
+        assert outcome.converged
+        assert outcome.state == "done"
+        assert outcome.exit_reason == ""
+
+    def test_a_relax_step_still_needs_the_force_criterion(self, tmp_path):
+        from cspflow.dft.vasp.parse import read_job_directory
+
+        d = tmp_path / "relax"
+        d.mkdir()
+        (d / "INCAR").write_text("IBRION = 1\nNSW = 99\n")
+        (d / "OUTCAR").write_text(
+            "   NIONS =      2\n"
+            " General timing and accounting informations for this job:\n")
+        (d / "OSZICAR").write_text(
+            "".join(f"  {i} F= -.20E+02 E0= -.20E+02  d E =0.0  mag=  1.0\n"
+                    for i in range(1, 100)))
+        outcome = read_job_directory(d)
+        assert not outcome.converged
+        assert outcome.exit_reason == "ionic_step_limit"
+
+    def test_advancing_a_step_clears_the_previous_remedy(self, cfg, store, tmp_path):
+        """A remedy belongs to the step that failed. Carried forward it rewrites
+        the next step's INCAR -- live, a relax retry's NSW=200 landed in the
+        static INCAR and a fixed-position calculation ran 200 ionic steps."""
+        [sid] = add_selected(store, 1)
+        store.set_structure_state(
+            sid, StructureState.selected,
+            **{"dft_last_remedy": json.dumps({"set": {"NSW": 200}, "remedy": ""})})
+        stage = DftStage(cfg)
+        outcome = type("O", (), {"energy": -1.0, "e_per_atom": -0.5,
+                                 "magnetisation": None})()
+        stage._advance(store, sid, step=0, outcome=outcome, directory=tmp_path)
+        assert store.get_structure(sid).key_value_pairs["dft_last_remedy"] == ""
+
+    def test_rank_by_orders_the_fresh_candidates(self, cfg, store, tmp_path):
+        ids = add_selected(store, 3)
+        for sid, hull in zip(ids, (0.30, 0.05, 0.20)):
+            store.update_structure(sid, e_above_hull_mlip=hull)
+        cfg.campaign.dft.select.rank_by = "e_above_hull_mlip"
+        ready = DftStage(cfg)._ready(store)
+        assert [int(r.id) for r in ready] == [ids[1], ids[2], ids[0]]
+
+    def test_a_candidate_with_no_ranking_value_sorts_last(self, cfg, store):
+        ids = add_selected(store, 2)
+        store.update_structure(ids[1], e_above_hull_mlip=0.9)
+        cfg.campaign.dft.select.rank_by = "e_above_hull_mlip"
+        ready = DftStage(cfg)._ready(store)
+        assert [int(r.id) for r in ready] == [ids[1], ids[0]]
+
+    def test_max_total_caps_the_campaign(self, cfg, store):
+        add_selected(store, 5)
+        cfg.campaign.dft.select.max_total = 2
+        assert len(DftStage(cfg)._ready(store)) == 2
+
+    def test_a_structure_already_started_keeps_its_place(self, cfg, store):
+        """Abandoning a half-finished relaxation to start a better-ranked one
+        from scratch spends more and finishes less."""
+        ids = add_selected(store, 3)
+        store.update_structure(ids[2], dft_step=1, e_above_hull_mlip=0.9)
+        for sid, hull in zip(ids[:2], (0.01, 0.02)):
+            store.update_structure(sid, e_above_hull_mlip=hull)
+        cfg.campaign.dft.select.rank_by = "e_above_hull_mlip"
+        cfg.campaign.dft.select.max_total = 1
+        ready = DftStage(cfg)._ready(store)
+        assert [int(r.id) for r in ready] == [ids[2]]

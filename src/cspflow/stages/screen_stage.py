@@ -67,16 +67,23 @@ class ScreenStage:
         in `screening`, which `csp status` reports as stuck -- visible, rather
         than quietly re-run forever.
         """
-        ids = store.structure_ids(state=StructureState.new.value)[: budget * self.chunk]
-        if not ids:
+        rows = [r for r in store.structures(state=StructureState.new.value)]
+        rows = rows[: budget * self.chunk]
+        if not rows:
             return []
+        # Seeds supplied with `relax: false` are read here, where the rows are
+        # already in hand, rather than reopened in `build`.
+        no_relax = {int(r.id) for r in rows
+                    if r.key_value_pairs.get("needs_relax") is False}
+        ids = [int(r.id) for r in rows]
         items = []
         for start in range(0, len(ids), self.chunk):
             batch = ids[start: start + self.chunk]
             for sid in batch:
                 store.set_structure_state(sid, StructureState.screening)
-            items.append(WorkItem(key=f"screen-{batch[0]}-{batch[-1]}",
-                                  structure_ids=batch))
+            items.append(WorkItem(
+                key=f"screen-{batch[0]}-{batch[-1]}", structure_ids=batch,
+                payload={"single_point": sorted(no_relax.intersection(batch))}))
         return items
 
     # -- the job -----------------------------------------------------------
@@ -99,6 +106,13 @@ class ScreenStage:
             "fmax": self.cfg.campaign.screen.mattersim.fmax,
             "max_steps": self.cfg.campaign.screen.mattersim.max_steps,
             "chunks": [item.structure_ids for item in items],
+            # Seeds supplied with `relax: false` get a single point instead.
+            # The flag was written onto the structure at source time and read by
+            # nothing, so `relax: false` -- documented as "MLIP-relax the seed
+            # before DFT" -- relaxed it anyway, moving a geometry the user
+            # supplied on purpose. Mode 3's control-group use depends on this.
+            "single_point": sorted({sid for item in items
+                                    for sid in item.payload.get("single_point", [])}),
         }, indent=2))
 
         resources = self.cfg.campaign.screen.resources
@@ -152,7 +166,11 @@ class ScreenStage:
             )
             kv = {"mlip_e_per_atom": row["e_per_atom"],
                   "mlip_converged": bool(row["converged"]),
-                  "mlip_steps": int(row.get("n_steps", 0))}
+                  "mlip_steps": int(row.get("n_steps", 0)),
+                  # False for a seed the campaign asked not to move: its energy
+                  # is a single point at the geometry as supplied, and nothing
+                  # downstream should read it as a relaxed one.
+                  "mlip_relaxed": bool(row.get("relaxed", True))}
             if row.get("volume_drift") is not None:
                 kv["mlip_volume_drift"] = float(row["volume_drift"])
             store.set_structure_state(sid, StructureState.screened, **kv)

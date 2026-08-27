@@ -71,6 +71,11 @@ class DftStage:
         barrier between the cheap tier and the expensive one, and it cannot
         answer without some DFT of its own -- so its own members always pass,
         and everything else waits for its verdict.
+
+        Ordered by `select.rank_by` and capped by `select.max_total`. Both were
+        in the schema and the shipped template and read by nothing, so a
+        campaign asking for at most 1,500 DFT jobs ranked by hull distance got
+        every candidate in database order.
         """
         gate = self._pilot_gate(store)
         out = []
@@ -81,7 +86,45 @@ class DftStage:
                 step = int(row.key_value_pairs.get(STEP_KEY, 0))
                 if step < len(self.recipe.stages):
                     out.append(row)
-        return out
+        return self._rank_and_cap(store, out)
+
+    def _rank_and_cap(self, store: Store, rows: list[Any]) -> list[Any]:
+        """Order by `select.rank_by`, then apply `select.max_total`.
+
+        A structure already part-way through the recipe keeps its place at the
+        front: abandoning a half-finished relaxation to start a better-ranked
+        one from scratch spends more and finishes less.
+
+        `max_total` is a ceiling on the campaign, not a per-cycle throttle, so
+        the count includes every structure that has already entered DFT --
+        finished, failed or in progress. Capping the ready list alone would let
+        a finished structure make room for a new one and the campaign would
+        never stop.
+        """
+        select = getattr(self.cfg.campaign.dft, "select", None)
+        if select is None:
+            return rows
+
+        key = getattr(select, "rank_by", "") or ""
+        started = [r for r in rows if int(r.key_value_pairs.get(STEP_KEY, 0)) > 0]
+        fresh = [r for r in rows if int(r.key_value_pairs.get(STEP_KEY, 0)) == 0]
+
+        if key:
+            def rank(row):
+                value = row.key_value_pairs.get(key)
+                # A structure with no value for the ranking key sorts last, not
+                # first: an absent hull distance is not a good one.
+                return (value is None, float(value) if value is not None else 0.0)
+
+            fresh.sort(key=rank)
+
+        cap = getattr(select, "max_total", None)
+        if not cap:
+            return started + fresh
+
+        spent = _entered_dft(store)
+        room = max(int(cap) - spent, 0)
+        return (started + fresh)[:max(room, len(started))]
 
     def _pilot_gate(self, store: Store) -> str:
         """Why the expensive tier is held, or "" if it is open.
@@ -256,7 +299,12 @@ class DftStage:
         # rebuilt from a filename convention later. `analyze` reads it: the
         # alternative is a second place that knows how job directories are
         # named, and two such places drift.
+        # The remedy belongs to the step that failed. Carried into the next
+        # step it silently rewrites that step's INCAR -- live, a `relax` retry's
+        # `NSW: 200` landed in the `static` INCAR, so a fixed-position
+        # calculation ran two hundred identical ionic steps.
         kv: dict[str, Any] = {STEP_KEY: step + 1, ATTEMPT_KEY: 0,
+                              LAST_REMEDY_KEY: "",
                               DIR_KEY: str(directory.resolve())}
         if outcome.energy is not None:
             kv["vasp_energy"] = outcome.energy
@@ -405,3 +453,22 @@ def _read_contcar(path: Path):
         return ase.io.read(str(path), format="vasp")
     except Exception:
         return None
+
+
+def _entered_dft(store: Store) -> int:
+    """How many structures the campaign has already committed to DFT.
+
+    Everything that reached `dft_done`, everything past step 0, and everything
+    that failed with a DFT reason. A structure that failed still spent its
+    core-hours, so it counts against the ceiling.
+    """
+    seen = set()
+    for state in (StructureState.dft_done.value, StructureState.selected.value,
+                  StructureState.dft_queued.value, StructureState.dft_running.value,
+                  StructureState.failed.value):
+        for row in store.structures(state=state):
+            kv = row.key_value_pairs
+            if int(kv.get(STEP_KEY, 0)) > 0 or state == StructureState.dft_done.value \
+                    or kv.get("dft_fail_reason"):
+                seen.add(int(row.id))
+    return len(seen)

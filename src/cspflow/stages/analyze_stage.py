@@ -125,10 +125,18 @@ class AnalyzeStage:
         return done, problems
 
     def _f_treatment(self) -> str:
-        dft = self.cfg.campaign.dft
-        if dft is None or dft.magnetism is None:
-            return "frozen"
-        rare_earth = getattr(dft.magnetism, "rare_earth", None)
+        """Which 4f treatment the DFT used, and whether to reconstruct at all.
+
+        `rare_earth.reconstruct_ms: false` was in the shipped template and read
+        by nothing, so a campaign that asked for the raw number only got the
+        Hund's-rule column anyway. Returning a treatment other than `frozen`
+        is how `reconstruct` is told not to add anything -- it already refuses
+        there, and for the same reason.
+        """
+        dft = getattr(self.cfg.campaign, "dft", None)
+        rare_earth = getattr(dft, "rare_earth", None) if dft else None
+        if rare_earth is not None and not getattr(rare_earth, "reconstruct_ms", True):
+            return "no_reconstruction"
         treatment = getattr(rare_earth, "f_treatment", None) if rare_earth else None
         return getattr(treatment, "value", treatment) or "frozen"
 
