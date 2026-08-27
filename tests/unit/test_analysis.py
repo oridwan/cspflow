@@ -239,3 +239,29 @@ def test_an_absent_contcar_is_a_warning_not_a_crash(tmp_path):
     props = extract(tmp_path)
     assert props.volume is None
     assert any("CONTCAR" in w for w in props.warnings)
+
+
+# -- formula units ---------------------------------------------------------
+
+def test_z_is_the_gcd_of_the_element_counts():
+    """`m_per_formula_unit` divided by a `z` key that nothing ever wrote, so it
+    always divided by 1 and was the cell magnetisation under another name."""
+    from cspflow.analysis.properties import formula_units
+
+    assert formula_units(["Gd"] * 2 + ["Cr"] * 4 + ["Co"] * 20) == 2
+    assert formula_units(["Fe"] * 11 + ["Sm", "Ti"]) == 1
+    assert formula_units(["Fe"] * 4) == 4
+    assert formula_units([]) == 1
+
+
+@has_real
+def test_the_per_formula_unit_moment_is_actually_per_formula_unit():
+    props = extract(REAL)
+    assert props.z == 2
+    assert props.m_per_formula_unit == pytest.approx(props.m_dft_raw / 2)
+
+
+def test_an_explicit_z_still_wins(tmp_path):
+    """The caller can override; it just no longer has to guess."""
+    props = extract(tmp_path, z=7)
+    assert props.z == 7

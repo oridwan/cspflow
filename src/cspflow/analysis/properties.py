@@ -19,6 +19,7 @@ forward would report every candidate as triclinic.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -106,7 +107,22 @@ def spacegroup_of(atoms, symprec: float = SPACEGROUP_SYMPREC) -> tuple[int | Non
         return None, f"symmetry analysis failed: {type(exc).__name__}: {exc}"
 
 
-def extract(job_dir: Path, *, structure_id: int | None = None, z: int = 1,
+def formula_units(symbols: list[str]) -> int:
+    """How many formula units the cell contains: the gcd of its element counts.
+
+    Derived from the structure rather than looked up, because the alternative
+    was a `z` key on the structure row that nothing ever wrote -- so
+    `m_per_formula_unit` divided by 1 and was the cell magnetisation under
+    another name. For `Gd2Cr4Co20` this returns 2, and the per-formula-unit
+    moment is half the cell value.
+    """
+    counts: dict[str, int] = {}
+    for symbol in symbols:
+        counts[symbol] = counts.get(symbol, 0) + 1
+    return math.gcd(*counts.values()) if counts else 1
+
+
+def extract(job_dir: Path, *, structure_id: int | None = None, z: int | None = None,
             f_treatment: str = "frozen") -> StructureProperties:
     """Read one relaxation directory into a property record.
 
@@ -120,7 +136,7 @@ def extract(job_dir: Path, *, structure_id: int | None = None, z: int = 1,
 
     job_dir = Path(job_dir)
     outcome = read_job_directory(job_dir)
-    props = StructureProperties(structure_id=structure_id, z=z,
+    props = StructureProperties(structure_id=structure_id, z=z or 1,
                                 f_treatment=f_treatment,
                                 energy=outcome.energy, e_per_atom=outcome.e_per_atom,
                                 converged=outcome.converged)
@@ -135,6 +151,9 @@ def extract(job_dir: Path, *, structure_id: int | None = None, z: int = 1,
 
     atoms = ase.io.read(str(contcar), format="vasp")
     symbols = symbols_of(atoms)
+    # Z from the cell itself unless the caller insists otherwise.
+    if z is None:
+        props.z = formula_units(symbols)
     props.n_atoms = len(symbols)
     props.formula = canonical_formula(counts_of(symbols))
     props.volume = float(atoms.get_volume())

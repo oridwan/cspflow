@@ -97,8 +97,10 @@ class AnalyzeStage:
                 problems.append(f"{sid}: no DFT directory")
                 continue
 
+            # No `z` argument: it is derived from the cell. The row's own `z`
+            # key was read here and written nowhere, so every per-formula-unit
+            # moment was divided by 1 -- the cell value under another name.
             props = extract(Path(directory), structure_id=sid,
-                            z=int(row.key_value_pairs.get("z", 1) or 1),
                             f_treatment=treatment)
             kv = props.as_kv()
             kv[DONE_KEY] = True
