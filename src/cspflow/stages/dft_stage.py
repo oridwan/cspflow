@@ -43,6 +43,7 @@ from .base import StageReport, WorkItem
 # from the filesystem so that a restarted driver reads it rather than guessing.
 STEP_KEY = "dft_step"
 DIR_KEY = "dft_dir"
+LAST_REMEDY_KEY = "dft_last_remedy"
 # Set by calibrate:pilot on the structures it chose. Mirrored here rather than
 # imported to keep the two stages from importing each other.
 PILOT_KEY = "pilot"
@@ -113,15 +114,25 @@ class DftStage:
     def claim(self, store: Store, budget: int) -> list[WorkItem]:
         items = []
         for row in self._ready(store)[:budget]:
-            step = int(row.key_value_pairs.get(STEP_KEY, 0))
+            kv = row.key_value_pairs
+            step = int(kv.get(STEP_KEY, 0))
             stage = self.recipe.stages[step]
             store.set_structure_state(int(row.id), StructureState.dft_queued,
                                       **{STEP_KEY: step})
+            # The ladder's decision, carried forward. Without this the remedy was
+            # recorded on the row and then never read: `set: {NSW: 200}` was
+            # stored as `dft_last_remedy` and the rerun was written with the
+            # original NSW. Every retry repeated the identical calculation and
+            # failed the identical way, which is worse than not retrying at all
+            # -- it costs the same again and looks like diligence.
+            remedy = _decode_remedy(kv.get(LAST_REMEDY_KEY))
             items.append(WorkItem(
                 key=f"dft-{row.id}-{stage.name}",
                 structure_ids=[int(row.id)],
                 payload={"step": step, "step_name": stage.name,
-                         "attempt": int(row.key_value_pairs.get(ATTEMPT_KEY, 0))},
+                         "attempt": int(kv.get(ATTEMPT_KEY, 0)),
+                         "incar_overrides": remedy.get("set", {}),
+                         "remedy": remedy.get("remedy", "")},
             ))
         return items
 
@@ -174,11 +185,23 @@ class DftStage:
     def _write_inputs(self, item: WorkItem, directory: Path) -> None:
         from ..db.store import Store as _Store
 
+        # Whatever a previous attempt left here is moved aside before anything
+        # is written, so a retry does not erase the evidence of what it is
+        # retrying. `csp status --why` names the remedy; the archive is where
+        # you look to see whether it was the right one.
+        archived = _archive_previous(directory, int(item.payload.get("attempt", 0)))
+
         store = _Store.open(self.cfg.campaign_db)
         try:
             atoms = store.get_structure(item.structure_ids[0]).toatoms()
         finally:
             store.close()
+
+        if item.payload.get("remedy") == "resume_from_contcar" and archived:
+            resumed = _read_contcar(archived / "CONTCAR")
+            if resumed is not None:
+                atoms = resumed
+                item.payload["resumed_from"] = str(archived / "CONTCAR")
 
         stage = self.recipe.stages[item.payload["step"]]
         overrides = item.payload.get("incar_overrides") or {}
@@ -266,7 +289,8 @@ class DftStage:
         store.set_structure_state(
             sid, StructureState.selected,
             **{STEP_KEY: step, ATTEMPT_KEY: attempt,
-               "dft_last_remedy": json.dumps(rule.get("set", {}))[:200]},
+               LAST_REMEDY_KEY: json.dumps({"set": rule.get("set", {}),
+                                            "remedy": rule.get("remedy", "")})[:200]},
         )
 
     def _rule_for(self, step: int, outcome, status: JobStatus) -> dict | None:
@@ -310,3 +334,74 @@ class DftStage:
 def _max_attempts(stage) -> int:
     """One attempt per ladder rung, plus the original."""
     return len(stage.retry) + 1
+
+
+def _decode_remedy(raw) -> dict:
+    """The ladder rung a previous cycle chose, as `{set: {...}, remedy: str}`.
+
+    Tolerates the older shape, which stored the INCAR overrides alone.
+    """
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    if "set" in value or "remedy" in value:
+        return {"set": value.get("set") or {}, "remedy": value.get("remedy") or ""}
+    return {"set": value, "remedy": ""}
+
+
+def _archive_previous(directory: Path, attempt: int) -> Path | None:
+    """Move a finished run's files into `attempt-N/`, and say where they went.
+
+    Returns the most recent archive whether or not this call created it: a
+    directory whose outputs were archived by an earlier cycle still has a
+    previous attempt to resume from, and returning None there is how the resume
+    quietly turned back into a restart.
+    """
+    import shutil
+
+    directory = Path(directory)
+    if (directory / "OUTCAR").is_file():
+        target = directory / f"attempt-{max(attempt - 1, 0)}"
+        if not target.exists():
+            target.mkdir(parents=True, exist_ok=True)
+            for entry in sorted(directory.iterdir()):
+                if entry.is_dir() or entry.name.startswith("attempt-"):
+                    continue
+                shutil.move(str(entry), str(target / entry.name))
+        return target
+    return _latest_archive(directory)
+
+
+def _latest_archive(directory: Path) -> Path | None:
+    """The highest-numbered `attempt-N/` in `directory`, or None."""
+    archives = []
+    for entry in Path(directory).glob("attempt-*"):
+        if not entry.is_dir():
+            continue
+        suffix = entry.name.split("-", 1)[1]
+        if suffix.isdigit():
+            archives.append((int(suffix), entry))
+    return max(archives)[1] if archives else None
+
+
+def _read_contcar(path: Path):
+    """The relaxed geometry a previous attempt reached, or None.
+
+    A CONTCAR that is absent or empty is the normal outcome of a job that died
+    before its first ionic step, and resuming from nothing is not a resume --
+    the caller falls back to the structure in the database.
+    """
+    import ase.io
+
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    try:
+        return ase.io.read(str(path), format="vasp")
+    except Exception:
+        return None

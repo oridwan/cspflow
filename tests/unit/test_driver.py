@@ -533,3 +533,22 @@ def test_a_job_with_no_claim_record_says_so_rather_than_reconciling_empty(cfg, s
                     sleep=lambda _s: None, emit=lines.append)
     second.cycle(2)
     assert any("no claim record" in line for line in lines)
+
+
+def test_the_job_row_records_the_recipe_step_and_attempt(cfg, store):
+    """The columns existed and were never written, so every DFT job row read
+    `step='' attempt=0` however far up the ladder it actually was -- which is
+    precisely the history `csp status --why` exists to show."""
+
+    class Laddered(FakeStage):
+        def claim(self, store, budget):
+            taken, self.pool = self.pool[:budget], self.pool[budget:]
+            return [WorkItem(key=f"s{i}", structure_ids=[i],
+                             payload={"step_name": "relax", "attempt": 2})
+                    for i in taken]
+
+    d = driver(cfg, store, FakeScheduler(), [Laddered(work=2)], stages=["dft"])
+    d.cycle(1)
+    rows = store.jobs(stage="dft")
+    assert rows and all(r["recipe_step"] == "relax" for r in rows)
+    assert all(r["attempt"] == 2 for r in rows)

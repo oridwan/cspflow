@@ -282,3 +282,162 @@ class TestPlumbing:
 
     def test_the_recipe_is_the_campaigns(self, cfg):
         assert DftStage(cfg).recipe.stage_names == ["relax", "static"]
+
+
+# -- the ladder has to change something ------------------------------------
+
+class TestTheLadderActuallyApplies:
+    """A retry that reruns the identical calculation is worse than no retry.
+
+    It costs the same again, fails the same way, and looks like diligence. The
+    remedy was recorded on the structure row as `dft_last_remedy` and read by
+    nothing: `claim` never put it in the payload, so `_write_inputs` always saw
+    an empty override dict.
+
+    Found live: three VASP relaxations hit the ionic step limit, the ladder
+    recorded `{"NSW": 200}`, and the INCAR written for the retry said `NSW = 99`.
+    """
+
+    def test_the_incar_override_reaches_the_written_incar(self, cfg, store, tmp_path):
+        [sid] = add_selected(store, 1)
+        store.set_structure_state(sid, StructureState.selected,
+                                  **{ATTEMPT_KEY: 1,
+                                     "dft_last_remedy": json.dumps(
+                                         {"set": {"NSW": 200}, "remedy": ""})})
+        stage = DftStage(cfg)
+        items = stage.claim(store, budget=1)
+        assert items[0].payload["incar_overrides"] == {"NSW": 200}
+
+    def test_the_older_remedy_shape_still_reads(self, cfg, store):
+        """It was stored as the bare override dict before the remedy was added."""
+        from cspflow.stages.dft_stage import _decode_remedy
+
+        assert _decode_remedy(json.dumps({"NSW": 200})) == {"set": {"NSW": 200},
+                                                            "remedy": ""}
+        assert _decode_remedy(None) == {}
+        assert _decode_remedy("not json") == {}
+
+    def test_the_remedy_name_is_carried_too(self, cfg, store):
+        [sid] = add_selected(store, 1)
+        store.set_structure_state(sid, StructureState.selected,
+                                  **{"dft_last_remedy": json.dumps(
+                                      {"set": {}, "remedy": "resume_from_contcar"})})
+        items = DftStage(cfg).claim(store, budget=1)
+        assert items[0].payload["remedy"] == "resume_from_contcar"
+
+
+class TestArchivingAndResuming:
+    """A retry must not erase the evidence of what it is retrying."""
+
+    def test_a_previous_attempt_is_moved_aside(self, tmp_path):
+        from cspflow.stages.dft_stage import _archive_previous
+
+        d = tmp_path / "job"
+        d.mkdir()
+        (d / "OUTCAR").write_text("old outcar")
+        (d / "OSZICAR").write_text("old oszicar")
+        (d / "INCAR").write_text("NSW = 99")
+
+        archived = _archive_previous(d, attempt=1)
+        assert archived == d / "attempt-0"
+        assert (archived / "OUTCAR").read_text() == "old outcar"
+        assert not (d / "OUTCAR").exists()
+
+    def test_a_first_attempt_archives_nothing(self, tmp_path):
+        from cspflow.stages.dft_stage import _archive_previous
+
+        d = tmp_path / "job"
+        d.mkdir()
+        assert _archive_previous(d, attempt=0) is None
+
+    def test_archiving_twice_does_not_lose_the_first_archive(self, tmp_path):
+        from cspflow.stages.dft_stage import _archive_previous
+
+        d = tmp_path / "job"
+        d.mkdir()
+        (d / "OUTCAR").write_text("first")
+        _archive_previous(d, attempt=1)
+        (d / "OUTCAR").write_text("second")
+        second = _archive_previous(d, attempt=1)
+        assert (second / "OUTCAR").read_text() == "first"
+
+    def test_resuming_reads_the_previous_contcar(self, tmp_path):
+        import ase.io
+        from ase.build import bulk
+
+        from cspflow.stages.dft_stage import _read_contcar
+
+        atoms = bulk("Fe", "bcc", a=2.87, cubic=True)
+        path = tmp_path / "CONTCAR"
+        ase.io.write(str(path), atoms, format="vasp")
+        read = _read_contcar(path)
+        assert read is not None and len(read) == len(atoms)
+
+    def test_an_empty_contcar_is_not_a_resume(self, tmp_path):
+        from cspflow.stages.dft_stage import _read_contcar
+
+        path = tmp_path / "CONTCAR"
+        path.write_text("")
+        assert _read_contcar(path) is None
+        assert _read_contcar(tmp_path / "absent") is None
+
+    @has_potcars
+    def test_a_resume_starts_from_the_relaxed_geometry(self, cfg, store, tmp_path):
+        import ase.io
+
+        [sid] = add_selected(store, 1)
+        stage = DftStage(cfg)
+        workdir = tmp_path / "dft"
+
+        # First attempt: write inputs, then pretend VASP ran and moved the cell.
+        first = stage.claim(store, budget=1)
+        stage.build(first, workdir)
+        directory = workdir / first[0].key
+        (directory / "OUTCAR").write_text("pretend")
+        moved = ase.io.read(str(directory / "POSCAR"), format="vasp")
+        moved.set_cell(moved.get_cell() * 1.05, scale_atoms=True)
+        ase.io.write(str(directory / "CONTCAR"), moved, format="vasp")
+
+        # Second attempt, with the resume remedy recorded.
+        store.set_structure_state(
+            sid, StructureState.selected,
+            **{ATTEMPT_KEY: 1, "dft_last_remedy": json.dumps(
+                {"set": {"NSW": 200}, "remedy": "resume_from_contcar"})})
+        second = stage.claim(store, budget=1)
+        stage.build(second, workdir)
+
+        assert (directory / "attempt-0" / "OUTCAR").is_file()
+        assert second[0].payload["resumed_from"].endswith("attempt-0/CONTCAR")
+        written = ase.io.read(str(directory / "POSCAR"), format="vasp")
+        assert written.get_volume() == pytest.approx(moved.get_volume(), rel=1e-6)
+        assert "NSW = 200" in (directory / "INCAR").read_text()
+
+
+def test_an_already_archived_directory_still_offers_its_previous_attempt(tmp_path):
+    """Returning None for a directory whose outputs a previous cycle already
+    archived is how a resume quietly turns back into a restart."""
+    from cspflow.stages.dft_stage import _archive_previous, _latest_archive
+
+    d = tmp_path / "job"
+    (d / "attempt-0").mkdir(parents=True)
+    (d / "attempt-0" / "CONTCAR").write_text("relaxed")
+    assert _archive_previous(d, attempt=1) == d / "attempt-0"
+    assert _latest_archive(d) == d / "attempt-0"
+
+
+def test_the_latest_archive_wins(tmp_path):
+    from cspflow.stages.dft_stage import _latest_archive
+
+    d = tmp_path / "job"
+    for n in (0, 1, 2):
+        (d / f"attempt-{n}").mkdir(parents=True)
+    (d / "attempt-notanumber").mkdir()
+    assert _latest_archive(d) == d / "attempt-2"
+
+
+def test_no_archive_at_all_is_none(tmp_path):
+    from cspflow.stages.dft_stage import _latest_archive
+
+    d = tmp_path / "job"
+    d.mkdir()
+    assert _latest_archive(d) is None

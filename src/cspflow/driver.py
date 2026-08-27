@@ -451,14 +451,23 @@ class Driver:
         # (Found by killing a driver mid-submission: the structures were marked
         # `screening`, the job script and manifest were on disk, the worker was
         # running, and the job table held nothing at all.)
-        rows = [
-            self.store.add_job(
+        # `recipe_step` and `attempt` come from the item's payload where the
+        # stage put them. The columns existed and were never written, so every
+        # DFT job row read `step='' attempt=0` however far up the ladder it
+        # actually was -- which is precisely the history `csp status --why` is
+        # for.
+        rows = []
+        for item in items:
+            row = self.store.add_job(
                 stage=stage.name,
                 structure_id=item.structure_ids[0] if item.structure_ids else None,
+                recipe_step=str(item.payload.get("step_name", "")),
                 workdir=str(workdir),
             )
-            for item in items
-        ]
+            attempt = int(item.payload.get("attempt", 0))
+            if attempt:
+                self.store.update_job(row, attempt=attempt)
+            rows.append(row)
         job_id = self.scheduler.submit(spec)
         self.store.assert_job_id_is_new(str(job_id), stage.name, str(workdir))
         self._claims[str(job_id)] = items
