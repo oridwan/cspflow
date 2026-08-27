@@ -477,6 +477,36 @@ class Store:
         ).fetchone()
         return int(row["id"])
 
+    def update_reference_entry(self, entry_id: int, **fields: Any) -> None:
+        """Amend an existing reference entry in place.
+
+        Distinct from `add_reference_entry`, which is an upsert and therefore
+        has to supply every NOT NULL column. That makes it unable to express
+        "record the MLIP energy for an entry that already exists": SQLite
+        evaluates the INSERT before the ON CONFLICT clause, so the row fails on
+        `chemsys` being NULL even though the conflicting row has one.
+
+        Found when Stage 4a tried exactly that.
+        """
+        if not fields:
+            return
+        allowed = {
+            "run_type", "formula", "n_atoms", "e_dft_raw", "e_dft_corrected",
+            "correction", "e_mlip_static", "e_mlip_relaxed", "volume_drift",
+            "rmsd", "structure_id", "state", "fail_reason",
+        }
+        unknown = sorted(set(fields) - allowed)
+        if unknown:
+            raise StoreError(
+                f"unknown or immutable reference_entry field(s): {unknown}. "
+                f"Identity columns (mp_id, thermo_type, snapshot_id, chemsys) are not "
+                f"amendable -- a row whose identity changed is a different row."
+            )
+        assignments = ", ".join(f"{k}=?" for k in fields)
+        self.sql.execute(f"UPDATE reference_entry SET {assignments} WHERE id=?",
+                         [*fields.values(), entry_id])
+        self.sql.commit()
+
     def reference_entries(
         self, *, chemsys: str | None = None, include_subsystems: bool = False
     ) -> list[sqlite3.Row]:

@@ -184,6 +184,63 @@ def fetch_chemsys(
     return result
 
 
+def fetch_structures(
+    chemsys: str, *, api_key: str | None = None, cache: Path | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """MP's own DFT-relaxed structures, keyed by material id.
+
+    Needed for Stage 4a, which evaluates the MLIP **at MP's geometry** rather
+    than at its own -- see `calibrate/parity.py` for why that separation is not
+    optional.
+
+    Cached as CIF text alongside the energies. CIF rather than pymatgen's JSON
+    because it round-trips through both pymatgen and ASE, and the cache should
+    not require the library that wrote it.
+    """
+    path = _cache_path(chemsys, "structures", cache).with_suffix(".cif.json")
+    if path.is_file() and not refresh:
+        return _structures_from_cache(path)
+
+    key = api_key or os.environ.get("MP_API_KEY")
+    if not key:
+        raise ReferenceError(
+            "no Materials Project API key. Set MP_API_KEY in the environment; it is "
+            "read from there and never written to a cache file, a log or an error."
+        )
+    import warnings as _warnings
+
+    from mp_api.client import MPRester
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        with MPRester(key) as mpr:
+            docs = mpr.materials.summary.search(
+                chemsys=sub_systems(chemsys),
+                fields=["material_id", "structure"],
+            )
+
+    out = {str(d.material_id): d.structure for d in docs if d.structure is not None}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".partial")
+    tmp.write_text(json.dumps({mp_id: s.to(fmt="cif") for mp_id, s in out.items()}))
+    tmp.replace(path)
+    return out
+
+
+def _structures_from_cache(path: Path) -> dict[str, Any]:
+    from pymatgen.core import Structure
+
+    payload = json.loads(path.read_text())
+    out = {}
+    for mp_id, cif in payload.items():
+        try:
+            out[mp_id] = Structure.from_str(cif, fmt="cif")
+        except Exception:                                  # pragma: no cover
+            continue
+    return out
+
+
 def snapshot_id(entries: Iterable[ReferenceEntry]) -> str:
     """A hash over exactly the numbers that would change a hull.
 

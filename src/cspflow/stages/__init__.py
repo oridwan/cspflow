@@ -12,23 +12,23 @@ from pathlib import Path
 
 from ..config.loader import ResolvedConfig
 from .base import Stage, StageReport, WorkItem
+from .calibrate_stage import CalibrateStage
 from .dedup_stage import DedupStage
+from .filter_stage import FilterStage
 from .reference_stage import ReferenceStage
 from .screen_stage import ScreenStage
 from .source_stage import SourceStage
 
-__all__ = ["Stage", "StageReport", "WorkItem", "DedupStage", "ReferenceStage", "ScreenStage", "SourceStage",
+__all__ = ["Stage", "StageReport", "WorkItem", "CalibrateStage", "DedupStage", "FilterStage", "ReferenceStage", "ScreenStage", "SourceStage",
            "build_registry", "IMPLEMENTED", "PLANNED"]
 
 # What exists today, in funnel order.
-IMPLEMENTED = ["source", "screen", "dedup", "reference"]
+IMPLEMENTED = ["source", "screen", "dedup", "reference", "calibrate", "filter"]
 
 # What does not, and which milestone brings it. Named here so `csp run` can say
 # "screen arrives in M1" rather than "unknown stage".
 PLANNED = {
     "generate": "M3",
-    "calibrate": "M1",
-    "filter": "M1",
     "dft": "M2",
     "analyze": "M4",
 }
@@ -37,4 +37,5 @@ PLANNED = {
 def build_registry(cfg: ResolvedConfig, base_dir: Path | None = None) -> list[Stage]:
     """Every stage that has an implementation, given this configuration."""
     return [SourceStage(cfg, base_dir), ScreenStage(cfg), DedupStage(cfg),
-            ReferenceStage(cfg)]
+            ReferenceStage(cfg), CalibrateStage(cfg),
+            FilterStage(cfg)]
