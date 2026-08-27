@@ -27,6 +27,7 @@ Four things live here and nowhere else, so that policy exists in one place:
 
 from __future__ import annotations
 
+import json
 import signal
 import time
 from dataclasses import dataclass, field
@@ -95,6 +96,39 @@ class DriverOptions:
     stages: Sequence[str] | None = None     # None = every registered stage
     dry_run: bool = False
     budget_core_hours: float | None = None
+
+
+def _claim_path(workdir: Path, job_id: str) -> Path:
+    return Path(workdir) / f"claim-{job_id}.json"
+
+
+def _write_claim(workdir: Path, job_id: str, items: Sequence[WorkItem]) -> Path:
+    """Record which work went into which submission, next to the job itself."""
+    path = _claim_path(workdir, job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [{"key": i.key, "structure_ids": i.structure_ids,
+                "composition_ids": i.composition_ids, "payload": i.payload,
+                "est_core_hours": i.est_core_hours} for i in items]
+    tmp = path.with_suffix(".json.partial")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+    return path
+
+
+def _read_claim(workdir: Path, job_id: str) -> list[WorkItem] | None:
+    """The claim a previous process wrote, or None if there is none."""
+    path = _claim_path(workdir, job_id)
+    if not path.is_file():
+        return None
+    try:
+        rows = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return [WorkItem(key=r["key"], structure_ids=r.get("structure_ids", []),
+                     composition_ids=r.get("composition_ids", []),
+                     payload=r.get("payload", {}),
+                     est_core_hours=r.get("est_core_hours", 0.0))
+            for r in rows]
 
 
 def _estimate_tasks(stage: Stage, store: Store, budget: int) -> int:
@@ -282,7 +316,15 @@ class Driver:
         stage = next((s for s in self.stages if s.name == job["stage"]), None)
         if stage is None:
             return
-        items = self._claims.pop(str(job["slurm_id"]), [])
+        slurm_id = str(job["slurm_id"])
+        items = self._claims.pop(slurm_id, None)
+        if items is None:
+            items = _read_claim(Path(job["workdir"]), slurm_id)
+        if items is None:
+            self.emit(f"  cannot reconcile {job['stage']} job {slurm_id}: no claim "
+                      f"record in memory or in {job['workdir']}. Its results are on "
+                      f"disk and unread.")
+            return
         stage.reconcile(self.store, job, status, items)
 
     # -- accounting --------------------------------------------------------
@@ -420,6 +462,15 @@ class Driver:
         job_id = self.scheduler.submit(spec)
         self.store.assert_job_id_is_new(str(job_id), stage.name, str(workdir))
         self._claims[str(job_id)] = items
+        # And on disk, because the claim has to outlive this process.
+        #
+        # `csp run --only generate` then, later, `csp run --only screen` is the
+        # documented way to work: submit now, reconcile when the queue gets to
+        # it. With the claim only in memory the second process reconciled with
+        # an empty item list -- so every stage's loop ran zero times, the job
+        # was marked done, and 36 generated structures sat in their extxyz files
+        # unread with nothing reporting a problem.
+        _write_claim(workdir, str(job_id), items)
         for row in rows:
             self.store.update_job(row, state="queued", slurm_id=str(job_id))
         out.submitted = len(items)

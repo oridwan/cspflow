@@ -396,6 +396,28 @@ class OnFail(str, Enum):
     block = "block"
 
 
+def _on_fail(value: Any) -> Any:
+    """Undo YAML 1.1's boolean coercion of `off`.
+
+    PyYAML implements YAML 1.1, where bare `off`, `no` and `false` are all the
+    boolean False -- so `on_fail: off`, written exactly as the documentation
+    says, reaches pydantic as `False` and is rejected with a message about an
+    enum that mentions neither YAML nor booleans.
+
+    The same trap bit the DFT retry ladder, where `on:` became `True:` and a
+    retry rule silently had no condition (D065). There it was caught by
+    refusing the key; here the value is simply translated, because `off` is a
+    legitimate thing to write and the user is not wrong.
+    """
+    if value is False:
+        return "off"
+    if value is True:
+        raise ValueError(
+            "on_fail must be 'off', 'warn' or 'block'. YAML 1.1 reads a bare "
+            "`on` as the boolean True; quote it if you meant a word.")
+    return value
+
+
 class CalibrateMPThresholds(Base):
     mae_e_per_atom: float = Field(0.05, gt=0, description="single-point MLIP on MP geometry")
     spearman_min: float = Field(0.90, ge=-1.0, le=1.0)
@@ -422,6 +444,8 @@ class CalibrateMP(Base):
     on_fail: OnFail = OnFail.warn
     thresholds: CalibrateMPThresholds = Field(default_factory=CalibrateMPThresholds)
 
+    _fix_on_fail = field_validator("on_fail", mode="before")(_on_fail)
+
 
 class CalibratePilot(Base):
     """4b: costs pilot DFT.  OUR DFT is the yardstick.  This is the real gate.
@@ -434,6 +458,8 @@ class CalibratePilot(Base):
     on_fail: OnFail = OnFail.block
     pilot_n: int = Field(40, gt=0, description="screened candidates given pilot DFT")
     thresholds: CalibratePilotThresholds = Field(default_factory=CalibratePilotThresholds)
+
+    _fix_on_fail = field_validator("on_fail", mode="before")(_on_fail)
 
 
 class Calibrate(Base):

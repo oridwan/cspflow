@@ -40,6 +40,26 @@ from .base import (GenerationOutcome, GenerationRequest, GeneratorError,
 # subprocess, so a short request must not be timed out by its own startup.
 STARTUP_SECONDS = 600
 
+# MatterGen's Hydra sampling configs, vendored. See sampling_conf/README.md:
+# the PyPI distribution of mattergen ships no YAML at all, while the path its
+# code looks in is `<site-packages>/sampling_conf`. Generation from a normal
+# `pip install mattergen` therefore cannot start.
+VENDORED_SAMPLING_CONF = Path(__file__).resolve().parent / "sampling_conf"
+
+# GemNet-dT's activation scaling factors. See mattergen_data/README.md.
+#
+# This one cannot be pointed at from the outside. `GemNetT.__init__` accepts a
+# `scale_file` argument and then, on its first line, throws it away:
+#
+#     scale_file = f"{MODELS_PROJECT_ROOT}/common/gemnet/gemnet-dT.json"
+#     assert scale_file is not None, "`scale_file` is required."
+#
+# so the file must physically exist inside the installed package, and the
+# checkpoint's own `scale_file` -- which points at whatever path the training
+# machine used -- is ignored either way. The wheel does not ship it, so a plain
+# `pip install mattergen` cannot instantiate the model at all.
+VENDORED_SCALE_FILE = Path(__file__).resolve().parent / "mattergen_data" / "gemnet-dT.json"
+
 
 class MatterGenEngine:
     """One configured MatterGen checkpoint."""
@@ -64,6 +84,68 @@ class MatterGenEngine:
         self.record_trajectories = bool(record_trajectories)
 
     # -- is this thing going to work ---------------------------------------
+
+    @staticmethod
+    def installed_sampling_conf() -> Path | None:
+        """MatterGen's own sampling-config directory, if the install has one."""
+        try:
+            from mattergen.common.utils.globals import DEFAULT_SAMPLING_CONFIG_PATH
+        except Exception:
+            return None
+        path = Path(DEFAULT_SAMPLING_CONFIG_PATH)
+        return path if path.is_dir() else None
+
+    @classmethod
+    def sampling_conf(cls) -> tuple[Path, bool]:
+        """`(directory, vendored)` -- where the sampling configs come from.
+
+        MatterGen's own copy wins where it exists, which is the case for an
+        editable install from a clone. It does not exist for a wheel install,
+        and rather than fail there, cspflow supplies its own verbatim copy and
+        says so.
+        """
+        installed = cls.installed_sampling_conf()
+        return (installed, False) if installed else (VENDORED_SAMPLING_CONF, True)
+
+    @staticmethod
+    def scale_file_target() -> Path | None:
+        """Where GemNet insists on finding its scaling factors."""
+        try:
+            import mattergen
+        except ImportError:
+            return None
+        return Path(mattergen.__file__).resolve().parent / "common" / "gemnet" / "gemnet-dT.json"
+
+    @classmethod
+    def installation_problems(cls) -> list[str]:
+        """Data files the mattergen wheel omits but its code requires.
+
+        Reported rather than worked around because there is nowhere to work
+        around them from: `GemNetT` discards the `scale_file` it is passed and
+        rebuilds the path from its own package location.
+        """
+        target = cls.scale_file_target()
+        if target is None:
+            return ["mattergen is not importable"]
+        if target.is_file():
+            return []
+        return [f"{target} is missing -- the mattergen wheel ships no data files, "
+                f"and GemNet rebuilds this path from its own package location, so "
+                f"nothing can point it elsewhere. `csp doctor --fix` installs "
+                f"cspflow's vendored copy: cp {VENDORED_SCALE_FILE} {target}"]
+
+    @classmethod
+    def repair_installation(cls) -> list[str]:
+        """Put the missing data files where mattergen's own code looks for them."""
+        import shutil
+
+        done = []
+        target = cls.scale_file_target()
+        if target is not None and not target.is_file() and VENDORED_SCALE_FILE.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(VENDORED_SCALE_FILE, target)
+            done.append(f"installed {target.name} into {target.parent}")
+        return done
 
     @property
     def is_checkpoint(self) -> bool:
@@ -99,6 +181,19 @@ class MatterGenEngine:
             problems.append(
                 f"model {self.model!r} is not a directory on disk but looks like a path. "
                 f"A pretrained name has no slash; a checkpoint must exist.")
+
+        directory, vendored = self.sampling_conf()
+        if not directory.is_dir():
+            problems.append(
+                f"no MatterGen sampling configs: neither the installed package's "
+                f"own directory nor {directory}. Generation cannot start without "
+                f"them.")
+        elif vendored:
+            name = "csp.yaml" if self.mode == "csp" else "default.yaml"
+            if not (directory / name).is_file():
+                problems.append(f"{directory} has no {name} for mode={self.mode!r}")
+
+        problems.extend(self.installation_problems())
 
         if not self.allow_cpu:
             problems.extend(self._gpu_problems())
@@ -179,6 +274,9 @@ class MatterGenEngine:
             cmd.append(f"--model_path={Path(self.model).expanduser().resolve()}")
         else:
             cmd.append(f"--pretrained_name={self.model}")
+        directory, vendored = self.sampling_conf()
+        if vendored:
+            cmd.append(f"--sampling_config_path={directory}")
         if self.mode == "csp":
             cmd.append("--sampling_config_name=csp")
             payload = json.dumps([dict(c) for c in counts], separators=(",", ":"))

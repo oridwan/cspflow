@@ -29,6 +29,7 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
+from typing import Sequence
 
 from ..config.schema import Machine
 from .base import JobSpec, JobState, JobStatus, Limits, chunk_array
@@ -251,13 +252,38 @@ class SlurmScheduler:
         statuses: dict[str, JobStatus] = {
             jid: JobStatus(job_id=jid, state=JobState.unknown) for jid in job_ids
         }
-        statuses.update(self._squeue(job_ids))
+        observed: dict[str, JobStatus] = {}
+        observed.update(self._squeue(job_ids))
         for jid, status in self._sacct(job_ids).items():
-            if statuses.get(jid) is None or statuses[jid].state is JobState.unknown:
-                statuses[jid] = status
-            elif not statuses[jid].state.terminal and status.state.terminal:
-                statuses[jid] = status
+            if jid not in observed or observed[jid].state is JobState.unknown:
+                observed[jid] = status
+            elif not observed[jid].state.terminal and status.state.terminal:
+                observed[jid] = status
+
+        # Answer for exactly the ids that were asked about.
+        #
+        # An array submission returns a base id from `sbatch` -- `26759039` --
+        # and both `squeue` and `sacct` report only its *tasks*, `26759039_0`,
+        # `26759039_1`, ... So a lookup on the base id finds nothing, the job
+        # comes back `unknown`, and `unknown` is deliberately never written as
+        # done. The array is therefore polled forever and never reconciled.
+        #
+        # Neither the local nor the fake scheduler shows this: both echo back
+        # whatever id they were handed. It appears only against a real queue,
+        # and it appeared on the first live array submission from this
+        # repository -- 36 generated structures, job COMPLETED, nothing ingested.
+        for jid in job_ids:
+            if jid in observed:
+                statuses[jid] = observed[jid]
+                continue
+            tasks = [s for tid, s in observed.items() if tid.startswith(f"{jid}_")]
+            if tasks:
+                statuses[jid] = aggregate_array(jid, tasks)
         return statuses
+
+    @staticmethod
+    def _aggregate(job_id: str, tasks: list[JobStatus]) -> JobStatus:  # pragma: no cover
+        return aggregate_array(job_id, tasks)
 
     def _squeue(self, job_ids: list[str]) -> dict[str, JobStatus]:
         result = self._run(
@@ -398,3 +424,50 @@ class SlurmScheduler:
                 f"stdout: {result.stdout.strip()}\nstderr: {result.stderr.strip()}"
             )
         return result
+
+
+def aggregate_array(job_id: str, tasks: Sequence[JobStatus]) -> JobStatus:
+    """One status for a whole array, from its tasks.
+
+    The array is finished only when every task is. A single running task keeps
+    the array running, because reconciling it now would hand a stage a
+    half-written set of results and mark the rest of them done.
+
+    Among terminal outcomes the worst wins, in the order failed > timeout >
+    cancelled > done: an array where one task ran out of walltime is not a
+    successful array, and the retry ladder needs the reason that will actually
+    lead somewhere.
+
+    Elapsed time is the maximum (the array's wall clock) and CPUs the sum
+    (its cost), which is what makes the campaign's core-hour total honest.
+    """
+    if not tasks:                                            # pragma: no cover
+        return JobStatus(job_id=job_id, state=JobState.unknown)
+
+    live = [t for t in tasks if not t.state.terminal]
+    if live:
+        worst = min(live, key=lambda t: _LIVE_ORDER.index(t.state)
+                    if t.state in _LIVE_ORDER else len(_LIVE_ORDER))
+        return JobStatus(
+            job_id=job_id, state=worst.state, reason=worst.reason,
+            raw_state=worst.raw_state,
+            elapsed_seconds=max(t.elapsed_seconds for t in tasks),
+            alloc_cpus=sum(t.alloc_cpus for t in tasks),
+        )
+
+    worst = min(tasks, key=lambda t: _TERMINAL_ORDER.index(t.state)
+                if t.state in _TERMINAL_ORDER else len(_TERMINAL_ORDER))
+    return JobStatus(
+        job_id=job_id, state=worst.state,
+        exit_code=worst.exit_code, signal=worst.signal, reason=worst.reason,
+        raw_state=worst.raw_state,
+        elapsed_seconds=max(t.elapsed_seconds for t in tasks),
+        alloc_cpus=sum(t.alloc_cpus for t in tasks),
+    )
+
+
+# Which live state speaks for an array that has not finished: a running task
+# means the array is running, a queued one that it is still queued.
+_LIVE_ORDER = [JobState.running, JobState.queued, JobState.pending, JobState.held]
+# Which terminal outcome speaks for a finished array.
+_TERMINAL_ORDER = [JobState.failed, JobState.timeout, JobState.cancelled, JobState.done]

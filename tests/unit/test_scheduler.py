@@ -241,7 +241,9 @@ class TestRenderScript:
         text = SlurmScheduler(orion).render_script(spec)
         assert "#SBATCH --gres=gpu:1" in text
         assert "#SBATCH --partition=GPU" in text
-        assert "module load cuda/11.8" in text
+        # No CUDA module: verified on a GPU node that torch's bundled runtime
+        # works with nothing loaded, and `cuda/11.8` no longer exists here.
+        assert "module load cuda" not in text
 
     def test_dependencies_are_afterok(self, orion, tmp_path):
         spec = self._spec(tmp_path, depends_on=["12345"])
@@ -376,3 +378,94 @@ def test_ids_are_still_stable_within_one_scheduler(tmp_path):
            for i in range(3)]
     assert len(set(ids)) == 3
     assert all(i.startswith("local-") for i in ids)
+
+
+# -- an array answers to the id sbatch returned ----------------------------
+
+class TestArrayAggregation:
+    """`sbatch` returns `26759039`; squeue and sacct report `26759039_0`, `_1`...
+
+    So a lookup on the base id finds nothing, the job polls back `unknown`, and
+    `unknown` is deliberately never written as done -- so the array is polled
+    forever and never reconciled. Neither the local nor the fake scheduler shows
+    this: both echo back whatever id they were handed.
+
+    It appeared on the first live array submission from this repository: 36
+    generated structures, job COMPLETED, nothing ingested.
+    """
+
+    @staticmethod
+    def task(index, state, elapsed=100.0, cpus=8, raw=""):
+        from cspflow.scheduler.slurm import aggregate_array  # noqa: F401
+
+        return JobStatus(job_id=f"77_{index}", state=state,
+                         elapsed_seconds=elapsed, alloc_cpus=cpus,
+                         raw_state=raw or state.value.upper())
+
+    def test_every_task_done_makes_the_array_done(self):
+        from cspflow.scheduler.slurm import aggregate_array
+
+        tasks = [self.task(i, JobState.done) for i in range(4)]
+        status = aggregate_array("77", tasks)
+        assert status.job_id == "77"
+        assert status.state is JobState.done
+
+    def test_one_running_task_keeps_the_array_running(self):
+        """Reconciling now would hand a stage half its results and mark the
+        rest done."""
+        from cspflow.scheduler.slurm import aggregate_array
+
+        tasks = [self.task(0, JobState.done), self.task(1, JobState.running)]
+        assert aggregate_array("77", tasks).state is JobState.running
+
+    def test_the_worst_terminal_outcome_wins(self):
+        from cspflow.scheduler.slurm import aggregate_array
+
+        tasks = [self.task(0, JobState.done), self.task(1, JobState.timeout)]
+        assert aggregate_array("77", tasks).state is JobState.timeout
+        tasks.append(self.task(2, JobState.failed))
+        assert aggregate_array("77", tasks).state is JobState.failed
+
+    def test_cost_is_summed_and_wall_time_is_the_maximum(self):
+        from cspflow.scheduler.slurm import aggregate_array
+
+        tasks = [self.task(0, JobState.done, elapsed=100.0, cpus=8),
+                 self.task(1, JobState.done, elapsed=300.0, cpus=8)]
+        status = aggregate_array("77", tasks)
+        assert status.elapsed_seconds == 300.0
+        assert status.alloc_cpus == 16
+
+    def test_poll_answers_for_the_id_it_was_asked_about(self, monkeypatch, tmp_path):
+        from cspflow.scheduler.slurm import SlurmScheduler
+
+        sched = SlurmScheduler(Machine(scheduler="slurm"))
+        monkeypatch.setattr(sched, "_squeue", lambda ids: {})
+        monkeypatch.setattr(sched, "_sacct", lambda ids: {
+            "77_0": JobStatus(job_id="77_0", state=JobState.done, alloc_cpus=8,
+                              elapsed_seconds=525.0, raw_state="COMPLETED"),
+            "77_1": JobStatus(job_id="77_1", state=JobState.done, alloc_cpus=8,
+                              elapsed_seconds=500.0, raw_state="COMPLETED"),
+        })
+        statuses = sched.poll(["77"])
+        assert set(statuses) == {"77"}
+        assert statuses["77"].state is JobState.done
+        assert statuses["77"].alloc_cpus == 16
+
+    def test_a_plain_job_is_untouched(self, monkeypatch):
+        from cspflow.scheduler.slurm import SlurmScheduler
+
+        sched = SlurmScheduler(Machine(scheduler="slurm"))
+        monkeypatch.setattr(sched, "_squeue", lambda ids: {})
+        monkeypatch.setattr(sched, "_sacct", lambda ids: {
+            "88": JobStatus(job_id="88", state=JobState.failed, raw_state="FAILED")})
+        assert sched.poll(["88"])["88"].state is JobState.failed
+
+    def test_a_job_nobody_remembers_stays_unknown(self, monkeypatch):
+        """Not `done`. Assuming success for a forgotten job is how an outage
+        becomes a campaign reported complete."""
+        from cspflow.scheduler.slurm import SlurmScheduler
+
+        sched = SlurmScheduler(Machine(scheduler="slurm"))
+        monkeypatch.setattr(sched, "_squeue", lambda ids: {})
+        monkeypatch.setattr(sched, "_sacct", lambda ids: {})
+        assert sched.poll(["99"])["99"].state is JobState.unknown

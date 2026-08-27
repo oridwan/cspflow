@@ -27,7 +27,16 @@ limits:
 
 modules:
   cpu: [intel/mkl/2024.0, intel/2024, intel-mpi/2021.11]
-  gpu: [cuda/11.8]
+  # No CUDA module. Verified on a GPU node 2026-08-27: the driver is 570.195.03
+  # (CUDA 12.8) and the cspflow env's torch 2.2.1+cu118 ships its own runtime,
+  # so `torch.cuda.is_available()` is True with nothing loaded.
+  #
+  # `cuda/11.8` -- which every script under /projects/mmi/shuo still loads -- no
+  # longer exists on this cluster; only 12.4, 12.8 and 13.2 do. `module load` of
+  # a missing module writes to stderr and still exits 0, so under `set -e` the
+  # job dies at the *next* command with no useful message. `csp doctor` now
+  # checks every configured module against `module -t avail`.
+  gpu: []
 
 env:
   OMP_NUM_THREADS: 1

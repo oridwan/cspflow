@@ -488,3 +488,48 @@ def test_an_orphaned_row_is_reported_every_cycle(cfg, store):
     assert "no scheduler id" in report.render()
     store.update_job(row, state="queued", slurm_id="7")
     assert store.orphan_jobs() == 0
+
+
+# -- claims outlive the process that made them -----------------------------
+
+def test_a_second_driver_can_reconcile_the_first_ones_job(cfg, store, tmp_path):
+    """`csp run --only generate` then, later, `csp run --only screen` is the
+    documented way to work: submit now, reconcile when the queue gets to it.
+
+    With the claim only in memory the second process reconciled with an empty
+    item list, so every stage's loop ran zero times, the job was marked done,
+    and the results sat on disk unread with nothing reporting a problem. Found
+    on a live submission: 36 generated structures, none ingested.
+    """
+    sched = FakeScheduler()
+    first = driver(cfg, store, sched, [FakeStage(work=2)], stages=["dft"])
+    first.cycle(1)
+    job_id = sched.submitted and "1001"
+    sched.statuses[job_id] = JobStatus(job_id=job_id, state=JobState.done,
+                                       raw_state="COMPLETED")
+
+    # A brand-new driver: nothing in memory, everything in the database.
+    second_stage = FakeStage(work=0)
+    second = driver(cfg, store, sched, [second_stage], stages=["dft"])
+    assert second._claims == {}
+    second.cycle(2)
+    assert second_stage.reconciled, "the second process reconciled with nothing"
+    assert second_stage.reconciled[0][2] == 2      # both items came back
+
+
+def test_a_job_with_no_claim_record_says_so_rather_than_reconciling_empty(cfg, store,
+                                                                          tmp_path):
+    sched = FakeScheduler()
+    d = driver(cfg, store, sched, [FakeStage(work=1)], stages=["dft"])
+    d.cycle(1)
+    # Remove the claim file, simulating a workdir that was cleaned up.
+    for path in Path(cfg.campaign.workdir).rglob("claim-*.json"):
+        path.unlink()
+    sched.statuses["1001"] = JobStatus(job_id="1001", state=JobState.done,
+                                       raw_state="COMPLETED")
+    lines = []
+    second = Driver(cfg, store, sched, [FakeStage(work=0)],
+                    DriverOptions(interval=0, stages=["dft"]),
+                    sleep=lambda _s: None, emit=lines.append)
+    second.cycle(2)
+    assert any("no claim record" in line for line in lines)

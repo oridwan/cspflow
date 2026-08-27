@@ -169,8 +169,97 @@ def check_potcars(cfg: ResolvedConfig, elements: list[str]) -> list[Check]:
 
 
 def _campaign_encut(cfg: ResolvedConfig) -> float | None:
-    value = cfg.campaign.dft.incar_overrides.get("ENCUT")
-    return float(value) if value is not None else None
+    """ENCUT as the campaign will actually write it.
+
+    It lives in the *recipe*, which is where the shipped `magnets.yaml` sets it
+    to 520 eV; `incar_overrides` only wins where a campaign overrides it.
+    Reading the overrides alone made this check warn "no ENCUT in the resolved
+    recipe" for every correctly configured campaign -- which is the worst
+    outcome for a guard, because it teaches the user to ignore the one warning
+    that exists to stop a composition-dependent cutoff.
+    """
+    override = cfg.campaign.dft.incar_overrides.get("ENCUT")
+    if override is not None:
+        return float(override)
+
+    try:
+        from .dft.recipe import load_recipe
+
+        recipe = load_recipe(cfg.campaign.dft.recipe)
+    except Exception:
+        return None
+    # The lowest ENCUT any step would use: a static step at a lower cutoff than
+    # the relax that fed it is the case worth warning about.
+    values = [float(stage.incar["ENCUT"]) for stage in recipe.stages
+              if stage.incar.get("ENCUT") is not None]
+    return min(values) if values else None
+
+
+def available_modules() -> set[str] | None:
+    """Every modulefile this cluster offers, or None if modules are unavailable.
+
+    `module` is a shell function, so it is invoked through a login shell.
+    `-t` gives one name per line; directory headers end in ':' and a default is
+    marked with a '(default)' suffix, both of which are stripped.
+    """
+    # Environment Modules writes the terse listing to **stderr** and exits 0,
+    # so both streams are read. Reading stdout alone gets an empty string and a
+    # clean exit code, which is indistinguishable from "this cluster has no
+    # modules" -- and would have skipped the check that exists to catch exactly
+    # the failure that motivated it.
+    try:
+        proc = subprocess.run(["bash", "-lc", "module -t avail"],
+                              capture_output=True, text=True, timeout=30.0)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    names = set()
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.endswith(":"):
+            continue
+        names.add(line.replace("(default)", "").strip())
+    return names or None
+
+
+def check_modules(machine: Machine) -> Check:
+    """Every module the profile loads must exist on this cluster.
+
+    `module load` of a missing modulefile writes an error to stderr and still
+    exits 0.  Under the `set -e` every generated script uses, the job therefore
+    dies at whatever command needed it, with a message about that command rather
+    than about the module.
+
+    Found the hard way: `cuda/11.8` was in this profile because every script
+    under /projects/mmi/shuo loads it, and the cluster now offers only 12.4,
+    12.8 and 13.2.  The first live GPU submission failed in zero seconds with
+    `Unable to locate a modulefile for 'cuda/11.8'` and nothing else.
+    """
+    wanted = {role: list(mods) for role, mods in machine.modules.items() if mods}
+    if not wanted:
+        return Check("modules", "ok", "the profile loads no modules")
+
+    available = available_modules()
+    if available is None:
+        return Check("modules", "skip", "`module` is not usable from here")
+
+    rows, worst = [], "ok"
+    for role, mods in sorted(wanted.items()):
+        for name in mods:
+            base = name.split("/")[0]
+            if name in available:
+                rows.append(f"{role:<4} {name:<24} present")
+            elif any(m.split("/")[0] == base for m in available):
+                alternatives = sorted(m for m in available if m.split("/")[0] == base)
+                rows.append(f"{role:<4} {name:<24} MISSING -- this cluster has "
+                            f"{', '.join(alternatives[:4])}")
+                worst = "fail"
+            else:
+                rows.append(f"{role:<4} {name:<24} MISSING -- no {base} module at all")
+                worst = "fail"
+    return Check("modules", worst,
+                 "a missing module still exits 0, so the job dies later and elsewhere",
+                 rows)
 
 
 def check_vasp(machine: Machine) -> Check:
@@ -325,7 +414,7 @@ def check_optional_deps(cfg: ResolvedConfig) -> Check:
                  "missing engines block only the stages that use them", rows)
 
 
-def check_generator(cfg: ResolvedConfig) -> Check:
+def check_generator(cfg: ResolvedConfig, *, fix: bool = False) -> Check:
     """The generation checkpoint, checked from the login node.
 
     Everything here is answerable without a GPU except the GPU itself, so the
@@ -342,13 +431,26 @@ def check_generator(cfg: ResolvedConfig) -> Check:
     if not cfg.campaign.needs_generation or cfg.campaign.generate is None:
         return Check("generator", "skip", "no source mode generates structures")
 
+    rows_fixed: list[str] = []
     try:
         from .generators import for_config
         engine = for_config(cfg.campaign.generate)
     except Exception as exc:                                     # pragma: no cover
         return Check("generator", "fail", f"could not build the generator: {exc}")
 
+    if fix:
+        repair = getattr(engine, "repair_installation", None)
+        if repair is not None:
+            for done in repair():
+                rows_fixed.append(done)
+
     rows = [f"engine {cfg.campaign.generate.engine}", f"model  {engine.model}"]
+    rows.extend(rows_fixed)
+    conf = getattr(engine, "sampling_conf", None)
+    if conf is not None:
+        directory, vendored = conf()
+        rows.append(f"config {directory}" + ("  (vendored -- the installed "
+                                             "mattergen ships none)" if vendored else ""))
     device = engine.device()
     rows.append(f"device {device}" + ("  (login node -- the job checks again)"
                                       if device == "cpu" else ""))
@@ -357,7 +459,8 @@ def check_generator(cfg: ResolvedConfig) -> Check:
     worst = "ok"
     for problem in problems:
         rows.append(problem)
-        worst = "fail" if "no checkpoints/" in problem or "not a directory" in problem else "warn"
+        worst = ("fail" if ("no checkpoints/" in problem or "not a directory" in problem
+                            or "is missing" in problem) else "warn")
     return Check("generator", worst, "checkpoint layout and CSP training", rows)
 
 
@@ -397,10 +500,11 @@ def run(cfg: ResolvedConfig, *, elements: list[str] | None = None, fix: bool = F
     else:
         report.add(Check("POTCAR resolution", "skip",
                          "no elements yet -- run `csp source` first, or pass --elements"))
+    report.add(check_modules(cfg.machine))
     report.add(check_vasp(cfg.machine))
     report.add(check_scheduler(cfg.machine))
     report.add(check_qos_limits())
     report.add(check_throttle(cfg))
     report.add(check_optional_deps(cfg))
-    report.add(check_generator(cfg))
+    report.add(check_generator(cfg, fix=fix))
     return report

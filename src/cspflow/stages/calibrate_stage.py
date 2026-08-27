@@ -27,9 +27,17 @@ from __future__ import annotations
 
 from ..calibrate.parity import ParityPoint, build_report, fit_threshold
 from ..config.loader import ResolvedConfig
-from ..db.store import Store
+from ..calibrate.parity import ParityPoint
+from ..calibrate.pilot import build_pilot_report, stratified_sample
+from ..db.store import Store, StructureState
 from ..reference.mp import ReferenceError, fetch_structures
 from .base import StageReport
+
+# Marks a structure as a member of the pilot set. Kept on the structure row
+# rather than in a side table so that `csp status --why` shows it, and so that
+# the DFT stage can let a pilot member through a gate that is holding everything
+# else back.
+PILOT_KEY = "pilot"
 
 
 class CalibrateStage:
@@ -41,6 +49,7 @@ class CalibrateStage:
         self.cfg = cfg
         self._engine = engine
         self.last_report = None
+        self.last_pilot = None
 
     @property
     def engine(self):
@@ -51,11 +60,25 @@ class CalibrateStage:
         return self._engine
 
     def pending(self, store: Store) -> int:
-        """Reference entries not yet given an MLIP single point."""
+        """Work in either half: 4a's single points, or 4b's pilot set."""
         row = store.sql.execute(
             "SELECT COUNT(*) n FROM reference_entry WHERE e_mlip_static IS NULL"
         ).fetchone()
-        return int(row["n"]) if row else 0
+        outstanding = int(row["n"]) if row else 0
+        return outstanding + (1 if self._pilot_has_work(store) else 0)
+
+    def _pilot_has_work(self, store: Store) -> bool:
+        """True when 4b could either select a pilot set or judge a finished one."""
+        if self.cfg.campaign.calibrate.pilot.on_fail == "off":
+            return False
+        members = _pilot_members(store)
+        if not members:
+            # Nothing selected yet, and something to select from.
+            return bool(_selectable(store))
+        if store.latest_calibration("pilot") is not None:
+            return False
+        return all(row.key_value_pairs.get("state") == StructureState.dft_done.value
+                   for row in members)
 
     def claim(self, store, budget):                        # pragma: no cover
         raise AssertionError("calibrate is an in-process stage; the driver calls run()")
@@ -67,6 +90,109 @@ class CalibrateStage:
         pass
 
     def run(self, store: Store) -> StageReport:
+        """4a then 4b.  They are one stage because they answer one question.
+
+        4a is free and diagnostic; 4b costs pilot DFT and is the gate. Running
+        them in one place means a campaign cannot accidentally have one without
+        the other, and `csp status` shows both verdicts side by side.
+        """
+        report = self._run_mp(store)
+        pilot_note = self._run_pilot(store)
+        if pilot_note:
+            report.note = f"{report.note}; 4b {pilot_note}" if report.note else f"4b {pilot_note}"
+        report.pending = self.pending(store)
+        return report
+
+    # -- 4b --------------------------------------------------------------
+
+    def _run_pilot(self, store: Store) -> str:
+        """Select a pilot set, or judge one that has come back."""
+        pilot = self.cfg.campaign.calibrate.pilot
+        if pilot.on_fail == "off":
+            return ""
+
+        members = _pilot_members(store)
+        if not members:
+            chosen = self._select_pilot(store, pilot.pilot_n)
+            if not chosen:
+                return ""
+            return (f"pilot set of {len(chosen)} selected and sent to DFT "
+                    f"(spread across the MLIP hull range, not the top {len(chosen)})")
+
+        if store.latest_calibration("pilot") is not None:
+            return ""
+
+        outstanding = [r for r in members
+                       if r.key_value_pairs.get("state") != StructureState.dft_done.value]
+        if outstanding:
+            return f"waiting on {len(outstanding)} of {len(members)} pilot DFT jobs"
+
+        return self._judge_pilot(store, members)
+
+    def _select_pilot(self, store: Store, n: int) -> list[int]:
+        """Take `n` screened candidates spread across the MLIP hull range."""
+        rows = _selectable(store)
+        if not rows:
+            return []
+        labels = [str(int(r.id)) for r in rows]
+        values = [float(r.key_value_pairs.get("e_above_hull_mlip",
+                                              r.key_value_pairs.get("mlip_e_per_atom", 0.0)))
+                  for r in rows]
+        chosen = [int(label) for label in stratified_sample(labels, values, n)]
+        for sid in chosen:
+            store.set_structure_state(sid, StructureState.selected, **{PILOT_KEY: True})
+            store.add_filter_event(structure_id=sid, gate="calibrate:pilot",
+                                   passed=True,
+                                   detail="selected for the pilot DFT set")
+        return chosen
+
+    def _judge_pilot(self, store: Store, members) -> str:
+        points = []
+        for row in members:
+            kv = row.key_value_pairs
+            mlip = kv.get("mlip_e_per_atom")
+            dft = kv.get("e_per_atom")
+            if mlip is None or dft is None:
+                continue
+            counts: dict[str, int] = {}
+            for symbol in row.toatoms().get_chemical_symbols():
+                counts[symbol] = counts.get(symbol, 0) + 1
+            points.append(ParityPoint(
+                label=str(int(row.id)), counts=counts,
+                e_mlip_per_atom=float(mlip), e_dft_per_atom=float(dft),
+                e_hull_mlip=kv.get("e_above_hull_mlip"),
+                e_hull_dft=kv.get("dft_e_above_hull"),
+            ))
+
+        if not points:
+            return ("pilot DFT finished but no structure has both an MLIP and a "
+                    "DFT energy; nothing to compare")
+
+        thresholds = self.cfg.campaign.calibrate.pilot.thresholds
+        report = build_pilot_report(
+            points,
+            mae_max=thresholds.mae_e_per_atom,
+            mae_hull_max=thresholds.mae_e_hull,
+            spearman_min=thresholds.spearman_min,
+            top_n=max(1, len(points) // 4),
+        )
+        self.last_pilot = report
+        store.add_calibration(
+            kind="pilot", n_points=report.n, verdict=report.verdict,
+            mae_e_per_atom=report.parity.mae_e_per_atom,
+            spearman=report.parity.spearman,
+            volume_drift=None,
+            detail=report.render()[:4000],
+        )
+        note = (f"{report.verdict.upper()} on {report.n}: "
+                f"MAE {report.parity.mae_e_per_atom * 1000:.0f} meV/atom")
+        if report.top_n:
+            note += f", top-{report.top_n} recovered {report.top_n_overlap}/{report.top_n}"
+        return note
+
+    # -- 4a --------------------------------------------------------------
+
+    def _run_mp(self, store: Store) -> StageReport:
         rows = [r for r in store.reference_entries() if r["e_mlip_static"] is None]
         if not rows:
             return StageReport(stage=self.name, note="every reference entry already has one")
@@ -158,3 +284,23 @@ def _to_atoms(structure):
     from pymatgen.io.ase import AseAtomsAdaptor
 
     return AseAtomsAdaptor.get_atoms(structure)
+
+
+def _pilot_members(store: Store) -> list:
+    """Every structure marked as part of the pilot set."""
+    return [row for row in store.structures()
+            if row.key_value_pairs.get(PILOT_KEY)]
+
+
+def _selectable(store: Store) -> list:
+    """Screened candidates a pilot set could be drawn from.
+
+    Deduplicated ones only: a pilot containing three settings of one structure
+    measures the model once and spends the DFT three times.
+    """
+    rows = [row for row in store.structures(state=StructureState.deduped.value)
+            if row.key_value_pairs.get("mlip_e_per_atom") is not None]
+    if rows:
+        return rows
+    return [row for row in store.structures(state=StructureState.screened.value)
+            if row.key_value_pairs.get("mlip_e_per_atom") is not None]

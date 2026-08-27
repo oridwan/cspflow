@@ -201,3 +201,51 @@ def test_expansion_happens_after_all_layers(tmp_path):
         load_campaign(p, env=env)
     rc = load_campaign(p, sets=[f"workdir={tmp_path}"], env=env)
     assert rc.campaign.workdir == str(tmp_path)
+
+
+# -- YAML 1.1 booleans, again ---------------------------------------------
+
+def test_on_fail_off_is_not_read_as_a_boolean(tmp_path):
+    """PyYAML implements YAML 1.1: a bare `off` is False.
+
+    So `on_fail: off`, written exactly as the documentation says, reached
+    pydantic as `False` and was rejected with a message about an enum that
+    mentioned neither YAML nor booleans. Same family as the retry ladder's
+    `on:` becoming `True:` (D065) -- but there the key is refused, and here the
+    value is translated, because `off` is a legitimate thing to write.
+    """
+    (tmp_path / "seeds").mkdir()
+    path = tmp_path / "c.yaml"
+    path.write_text(f"""\
+name: t
+machine: local
+workdir: {tmp_path}
+source:
+  - mode: structure_list
+    name: seeds
+    structure_list: {{paths: ["{tmp_path}/seeds"]}}
+calibrate:
+  mp: {{on_fail: off}}
+  pilot: {{on_fail: off}}
+""")
+    cfg = load_campaign(path)
+    assert cfg.campaign.calibrate.mp.on_fail.value == "off"
+    assert cfg.campaign.calibrate.pilot.on_fail.value == "off"
+
+
+def test_a_bare_on_is_refused_with_an_explanation(tmp_path):
+    (tmp_path / "seeds").mkdir()
+    path = tmp_path / "c.yaml"
+    path.write_text(f"""\
+name: t
+machine: local
+workdir: {tmp_path}
+source:
+  - mode: structure_list
+    name: seeds
+    structure_list: {{paths: ["{tmp_path}/seeds"]}}
+calibrate:
+  pilot: {{on_fail: on}}
+""")
+    with pytest.raises(ConfigError, match="YAML 1.1"):
+        load_campaign(path)

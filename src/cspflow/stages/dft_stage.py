@@ -43,6 +43,9 @@ from .base import StageReport, WorkItem
 # from the filesystem so that a restarted driver reads it rather than guessing.
 STEP_KEY = "dft_step"
 DIR_KEY = "dft_dir"
+# Set by calibrate:pilot on the structures it chose. Mirrored here rather than
+# imported to keep the two stages from importing each other.
+PILOT_KEY = "pilot"
 ATTEMPT_KEY = "dft_attempt"
 
 
@@ -61,14 +64,51 @@ class DftStage:
         return len(self._ready(store))
 
     def _ready(self, store: Store) -> list[Any]:
-        """Structures selected for DFT that are not finished and not in flight."""
+        """Structures selected for DFT that are not finished and not in flight.
+
+        Held back by the pilot gate unless they *are* the pilot. Stage 4b is the
+        barrier between the cheap tier and the expensive one, and it cannot
+        answer without some DFT of its own -- so its own members always pass,
+        and everything else waits for its verdict.
+        """
+        gate = self._pilot_gate(store)
         out = []
         for state in (StructureState.selected.value, StructureState.dft_done.value):
             for row in store.structures(state=state):
+                if gate and not row.key_value_pairs.get(PILOT_KEY):
+                    continue
                 step = int(row.key_value_pairs.get(STEP_KEY, 0))
                 if step < len(self.recipe.stages):
                     out.append(row)
         return out
+
+    def _pilot_gate(self, store: Store) -> str:
+        """Why the expensive tier is held, or "" if it is open.
+
+        `on_fail: block` (the default) means: no non-pilot DFT until 4b has
+        returned a verdict, and none at all if that verdict is FAIL. `warn`
+        reports and proceeds; `off` disables the gate entirely.
+
+        A campaign with no `calibrate:` block, or one whose pilot found nothing
+        to select from, is not gated -- the barrier exists to stop spending on a
+        model that has not been checked, not to stop a campaign that has nothing
+        to check it with.
+        """
+        calibrate = getattr(self.cfg.campaign, "calibrate", None)
+        pilot = getattr(calibrate, "pilot", None) if calibrate else None
+        policy = getattr(getattr(pilot, "on_fail", None), "value",
+                         getattr(pilot, "on_fail", "off"))
+        if policy != "block":
+            return ""
+
+        latest = store.latest_calibration("pilot")
+        if latest is None:
+            has_pilot = any(r.key_value_pairs.get(PILOT_KEY) for r in store.structures())
+            return ("waiting for the pilot calibration (4b)" if has_pilot
+                    else "")
+        if latest["verdict"] == "fail":
+            return f"pilot calibration FAILED: {latest['detail'][:120]}"
+        return ""
 
     def claim(self, store: Store, budget: int) -> list[WorkItem]:
         items = []

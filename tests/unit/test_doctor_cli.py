@@ -131,17 +131,33 @@ def test_4f_check_passes_on_a_consistent_series(campaign_file):
 
 
 @has_tree
-def test_encut_warning_when_absent_and_ok_when_explicit(campaign_file):
+def test_encut_is_read_from_the_recipe_not_only_from_the_overrides(campaign_file):
     """Removing MPRelaxSet removed the thing that was silently supplying
-    ENCUT=520, so doctor has to surface it."""
+    ENCUT=520, so doctor has to surface it -- but the shipped recipe sets it,
+    and reading only `incar_overrides` made this warn for every correctly
+    configured campaign. A guard that always fires teaches the user to ignore
+    the one warning that matters.
+    """
     cfg = load_campaign(campaign_file, machine="orion")
     by_name = {c.name: c for c in D.check_potcars(cfg, ["Sm", "Fe", "Ti"])}
-    assert by_name["ENCUT"].status == "warn"
+    assert by_name["ENCUT"].status == "ok"
+    assert "520" in by_name["ENCUT"].detail
 
     cfg2 = load_campaign(campaign_file, machine="orion",
-                         sets=["dft.incar_overrides.ENCUT=520"])
+                         sets=["dft.incar_overrides.ENCUT=700"])
     by_name2 = {c.name: c for c in D.check_potcars(cfg2, ["Sm", "Fe", "Ti"])}
     assert by_name2["ENCUT"].status == "ok"
+    assert "700" in by_name2["ENCUT"].detail
+
+
+def test_an_encut_below_the_potcars_still_warns(campaign_file):
+    """The case the check exists for: a cutoff lower than max(ENMAX) means the
+    basis is not converged for this composition set."""
+    cfg = load_campaign(campaign_file, machine="orion",
+                        sets=["dft.incar_overrides.ENCUT=100"])
+    by_name = {c.name: c for c in D.check_potcars(cfg, ["Sm", "Fe", "Ti"])}
+    assert by_name["ENCUT"].status == "warn"
+    assert "below max(ENMAX)" in by_name["ENCUT"].detail
 
 
 @has_tree

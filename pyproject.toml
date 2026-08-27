@@ -32,7 +32,7 @@ csp = "cspflow.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-cspflow = ["config/*.yaml", "machines/*.yaml", "db/*.sql", "dft/recipes/*.yaml", "templates/*.yaml"]
+cspflow = ["config/*.yaml", "machines/*.yaml", "db/*.sql", "dft/recipes/*.yaml", "templates/*.yaml", "generators/sampling_conf/*", "generators/mattergen_data/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
