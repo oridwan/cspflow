@@ -40,6 +40,7 @@ markers = [
     "cluster: needs a live SLURM scheduler",
     "network: needs outbound network (MP API)",
     "gpu: needs a GPU",
+    "slow: runs a real MLIP relaxation (seconds, not milliseconds)",
 ]
 
 [tool.ruff]

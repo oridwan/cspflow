@@ -37,6 +37,9 @@ class LocalScheduler:
 
     def submit(self, spec: JobSpec) -> str:
         job_id = f"local-{next(self._ids)}"
+        # Absolute: the job runs with cwd=workdir, so a path relative to the
+        # campaign directory resolves to nothing once we are inside it.
+        spec.workdir = spec.workdir.resolve()
         spec.workdir.mkdir(parents=True, exist_ok=True)
         script = spec.workdir / f"{spec.name}.sh"
         script.write_text(f"#!/bin/bash\nset -eo pipefail\n\n{spec.command}\n")

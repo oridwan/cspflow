@@ -19,6 +19,7 @@ from .driver import STAGE_ORDER, Driver, DriverError, DriverOptions
 from .scheduler import for_machine
 from .source import SourceError, expand_all, write_plan
 from .stages import IMPLEMENTED, PLANNED, build_registry
+from .worker import WorkerError, run_screen_task
 from .templates import scaffold
 
 app = typer.Typer(
@@ -53,7 +54,7 @@ def _load(campaign: Path, sets: list[str] | None, machine: str | None = None):
 
 
 def _db_path(cfg) -> Path:
-    return Path(cfg.campaign.workdir) / "campaign.db"
+    return cfg.campaign_db
 
 
 # --------------------------------------------------------------------------
@@ -322,6 +323,24 @@ def _stage_slice(through: str | None, from_: str | None, only: str | None) -> li
     if stop <= start:
         _die(f"--from {from_} comes after --through {through}; that selects nothing")
     return STAGE_ORDER[start:stop]
+
+
+@app.command("screen-worker", hidden=True)
+def screen_worker(
+    manifest: Annotated[Path, typer.Option("--manifest", help="written by the screen stage")],
+    task_id: Annotated[Optional[int], typer.Option("--task-id", help="defaults to $SLURM_ARRAY_TASK_ID")] = None,
+) -> None:
+    """Relax one chunk of a screen manifest.  Run by array tasks, not by hand.
+
+    Hidden because it is an implementation detail of the screen stage: it takes
+    a manifest the stage wrote and writes a results file the driver reads. It is
+    exposed as a command only because that is how a SLURM array task invokes it.
+    """
+    try:
+        out = run_screen_task(manifest, task_id)
+    except WorkerError as exc:
+        _die(str(exc))
+    typer.echo(str(out))
 
 
 @app.command()

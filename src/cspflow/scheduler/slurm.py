@@ -197,6 +197,10 @@ class SlurmScheduler:
         submission that did not happen, recorded as queued, is a row the driver
         waits on forever.
         """
+        # Absolute, for the same reason as LocalScheduler: `#SBATCH --chdir`
+        # puts the job inside workdir, where a path relative to the campaign
+        # directory no longer resolves.
+        spec.workdir = spec.workdir.resolve()
         spec.workdir.mkdir(parents=True, exist_ok=True)
         script = spec.workdir / f"{spec.name}.sbatch"
         script.write_text(self.render_script(spec))

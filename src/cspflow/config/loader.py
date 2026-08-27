@@ -205,6 +205,16 @@ class ResolvedConfig:
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def campaign_db(self) -> Path:
+        """Where this campaign's database lives.
+
+        One property rather than a convention repeated at each call site: the
+        driver, the CLI and every stage must agree on it, and a stage that
+        guessed differently would quietly build a second, empty campaign.
+        """
+        return Path(self.campaign.workdir) / "campaign.db"
+
+    @property
     def config_hash(self) -> str:
         """Stable hash over the resolved campaign, for provenance.
 

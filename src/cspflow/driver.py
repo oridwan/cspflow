@@ -366,7 +366,7 @@ class Driver:
         if not items:
             return out
 
-        workdir = Path(self.cfg.campaign.workdir) / stage.name
+        workdir = (Path(self.cfg.campaign.workdir) / stage.name).resolve()
         spec = stage.build(items, workdir)
         spec.array_throttle = spec.array_throttle or throttle.concurrent_tasks
 
