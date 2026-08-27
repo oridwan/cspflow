@@ -1,0 +1,229 @@
+"""The `csp` command line."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Annotated, Optional
+
+import typer
+import yaml
+
+from . import __version__, doctor as doctor_mod
+from .config.loader import ConfigError, load_campaign
+from .config.schema import Campaign
+from .db.store import Store, StoreError
+from .templates import scaffold
+
+app = typer.Typer(
+    name="csp",
+    help="High-throughput crystal structure prediction and first-principles discovery.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+config_app = typer.Typer(help="Inspect configuration.", no_args_is_help=True)
+app.add_typer(config_app, name="config")
+
+DEFAULT_CAMPAIGN = "campaign.yaml"
+
+CampaignOpt = Annotated[
+    Path, typer.Option("--campaign", "-c", help="campaign YAML file")
+]
+SetOpt = Annotated[
+    Optional[list[str]], typer.Option("--set", "-s", help="override, e.g. -s filter.e_above_hull_max=0.2")
+]
+
+
+def _die(message: str) -> None:
+    typer.secho(str(message), fg=typer.colors.RED, err=True)
+    raise typer.Exit(code=1)
+
+
+def _load(campaign: Path, sets: list[str] | None, machine: str | None = None):
+    try:
+        return load_campaign(campaign, sets=sets, machine=machine)
+    except ConfigError as exc:
+        _die(str(exc))
+
+
+def _db_path(cfg) -> Path:
+    return Path(cfg.campaign.workdir) / "campaign.db"
+
+
+# --------------------------------------------------------------------------
+
+
+@app.command()
+def version() -> None:
+    """Print the version."""
+    typer.echo(f"cspflow {__version__}")
+
+
+@app.command()
+def init(
+    name: Annotated[str, typer.Argument(help="campaign name")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="where to write the campaign file")] = Path(DEFAULT_CAMPAIGN),
+    machine: Annotated[str, typer.Option("--machine", "-m")] = "orion",
+    full: Annotated[bool, typer.Option("--full", help="include commented Tier-2 knobs")] = False,
+    force: Annotated[bool, typer.Option("--force", help="overwrite an existing file")] = False,
+) -> None:
+    """Write a starter campaign file.
+
+    Emits only the ~10 Tier-1 keys by default; `--full` adds the commonly tuned
+    Tier-2 knobs, commented out with their defaults shown.
+    """
+    if out.exists() and not force:
+        _die(f"{out} already exists (use --force to overwrite)")
+    out.write_text(scaffold(name=name, machine=machine, full=full))
+    typer.echo(f"wrote {out}")
+    typer.echo("Next: edit it, then run `csp doctor`.")
+
+
+@config_app.command("show")
+def config_show(
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
+    set_: SetOpt = None,
+    origins: Annotated[bool, typer.Option("--origins", help="show which layer supplied each value")] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="emit JSON")] = False,
+) -> None:
+    """Print the fully resolved configuration."""
+    cfg = _load(campaign, set_)
+    payload = cfg.campaign.model_dump(mode="json")
+    if as_json:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(yaml.safe_dump(payload, sort_keys=False, default_flow_style=False))
+    typer.echo(f"# machine:     {cfg.machine_path}")
+    typer.echo(f"# config_hash: {cfg.config_hash}")
+    if origins:
+        typer.echo("\n# where each value came from:")
+        for path in sorted(cfg.origins):
+            typer.echo(f"#   {path:<48} {cfg.origins[path]}")
+
+
+@config_app.command("defaults")
+def config_defaults() -> None:
+    """Print the schema's default values.
+
+    Derived from the pydantic models rather than a checked-in file, so the
+    defaults shown here cannot drift from the defaults actually applied.
+    """
+    skeleton = {
+        "name": "<required>",
+        "machine": "<required>",
+        "workdir": "<required>",
+        "source": "<required: a list of source entries>",
+    }
+    for field, info in Campaign.model_fields.items():
+        if field in skeleton:
+            continue
+        if info.default_factory is not None:
+            value = info.default_factory()
+            skeleton[field] = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+        else:
+            skeleton[field] = info.default
+    typer.echo(yaml.safe_dump(skeleton, sort_keys=False, default_flow_style=False))
+
+
+@app.command()
+def doctor(
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
+    set_: SetOpt = None,
+    machine: Annotated[Optional[str], typer.Option("--machine", "-m")] = None,
+    elements: Annotated[Optional[str], typer.Option("--elements", help="comma-separated, e.g. Sm,Fe,Ti")] = None,
+    fix: Annotated[bool, typer.Option("--fix", help="create the POTCAR symlink layout")] = False,
+) -> None:
+    """Check everything that can be known before a job is submitted.
+
+    Exits non-zero on any hard failure, so it can gate a submission script.
+    """
+    cfg = _load(campaign, set_, machine)
+
+    els: list[str] = []
+    if elements:
+        els = [e.strip() for e in elements.split(",") if e.strip()]
+    else:
+        db = _db_path(cfg)
+        if db.is_file():
+            try:
+                with Store.open(db) as store:
+                    els = sorted({e for cs in store.chemsystems() for e in cs.split("-")})
+            except StoreError:
+                els = []
+
+    report = doctor_mod.run(cfg, elements=els, fix=fix)
+    typer.echo(report.render())
+    if report.failed:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def status(
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
+    set_: SetOpt = None,
+    why: Annotated[Optional[int], typer.Option("--why", help="full life history of one structure id")] = None,
+) -> None:
+    """Show campaign progress."""
+    cfg = _load(campaign, set_)
+    db = _db_path(cfg)
+    if not db.is_file():
+        _die(f"no campaign database at {db}. Run `csp init` and then a stage.")
+
+    with Store.open(db) as store:
+        if why is not None:
+            _print_history(store, why)
+            return
+        s = store.summary()
+        typer.echo(f"campaign     {s['campaign']}")
+        typer.echo(f"database     {db}")
+        typer.echo(f"compositions {s['compositions']}  across {s['chemsystems']} chemical systems")
+        typer.echo(f"structures   {s['structures']}")
+        for state, n in sorted(s["structures_by_state"].items()):
+            typer.echo(f"    {state:<16} {n}")
+        typer.echo(f"reference    {s['reference_entries']} MP entries")
+        if s["jobs"]:
+            typer.echo("jobs")
+            for state, n in sorted(s["jobs"].items()):
+                typer.echo(f"    {state:<16} {n}")
+
+
+def _print_history(store: Store, sid: int) -> None:
+    try:
+        row = store.get_structure(sid)
+    except StoreError as exc:
+        _die(str(exc))
+    typer.echo(f"structure {sid}: {row.formula}")
+    for key, value in sorted(row.key_value_pairs.items()):
+        typer.echo(f"    {key:<20} {value}")
+    events = store.filter_events(sid)
+    if events:
+        typer.echo("  gates")
+        for e in events:
+            verdict = "pass" if e["passed"] else "FAIL"
+            typer.echo(f"    {e['gate']:<20} {verdict:<5} value={e['value']} threshold={e['threshold']}")
+    props = store.properties(sid)
+    if props:
+        typer.echo("  properties")
+        for p in props:
+            typer.echo(f"    {p['key']:<20} {p['value']}  ({p['source']})")
+    jobs = [j for j in store.jobs() if j["structure_id"] == sid]
+    if jobs:
+        typer.echo("  jobs")
+        for j in jobs:
+            typer.echo(
+                f"    {j['stage']}/{j['recipe_step'] or '-':<8} {j['state']:<9} "
+                f"attempt {j['attempt']}  {j['exit_reason']}"
+            )
+
+
+def main() -> None:
+    try:
+        app()
+    except KeyboardInterrupt:  # pragma: no cover
+        typer.secho("interrupted", fg=typer.colors.YELLOW, err=True)
+        sys.exit(130)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
