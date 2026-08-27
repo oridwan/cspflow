@@ -50,8 +50,12 @@ potcar_trees:
   VASP6.4: PBE_64
   VASP5.2: PBE_52
 
+# One environment for every role.  mattergen depends on mattersim, so they were
+# always meant to share an env; the legacy split (mattersim for MLIP, vaspflow
+# for DFT) is what forced every driver script to know which env each stage
+# needed.  Built by scripts/build_env.sh; see docs/DECISIONS.md D025.
 conda:
-  cpu: base
-  gpu: mattersim
+  cpu: cspflow
+  gpu: cspflow
 
 scratch: /scratch/$USER

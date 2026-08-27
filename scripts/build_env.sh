@@ -49,6 +49,24 @@ pip install --no-cache-dir torch_scatter torch_sparse torch_cluster \
 log "step 3/5: mattergen (pulls mattersim, numpy<2, pytorch-lightning)"
 pip install --no-cache-dir mattergen
 
+# mattergen leaves `ase` unpinned (>=3.22.1), so pip takes the newest -- but ASE
+# 3.29 moved `full_3x3_to_voigt_6_stress` from ase.constraints to ase.stress,
+# and mattersim 1.1.2 still imports it from the old location.  3.27.0 is the
+# newest ASE that keeps the symbol where mattersim expects it.
+#
+# mattersim 1.1.2 rather than a newer one is itself forced: from 1.2.0 onward it
+# requires numpy>=2.0 on Python >=3.10, which contradicts mattergen's numpy<2.0.
+# So the two packages pin each other, and ASE has to follow mattersim.
+log "step 3c/5: pin ase 3.27.0 (mattersim 1.1.2 needs the pre-3.29 location)"
+pip install --no-cache-dir "ase==3.27.0"
+
+# mattersim 1.1.2 does `import pkg_resources` in its __version__ module.
+# setuptools 81 removed pkg_resources, and pip pulls the newest setuptools by
+# default, so mattersim fails to import in a freshly built env. Pinning below
+# 81 is the fix; the alternative (patching mattersim) is not ours to make.
+log "step 3b/5: pin setuptools<81 (mattersim still imports pkg_resources)"
+pip install --no-cache-dir "setuptools<81"
+
 log "step 4/5: cspflow itself"
 pip install --no-cache-dir -e /projects/mmi/Ridwan/cspflow
 
@@ -68,5 +86,9 @@ print(f"  torch.cuda    compiled={torch.version.cuda} available={torch.cuda.is_a
 print("  (cuda unavailable on a login node is expected)")
 sys.exit(0 if ok else 1)
 PY
+
+log "writing lockfile"
+pip freeze > "/projects/mmi/Ridwan/cspflow/scripts/env.lock.txt"
+log "wrote scripts/env.lock.txt ($(wc -l < /projects/mmi/Ridwan/cspflow/scripts/env.lock.txt) packages)"
 
 log "done. activate with: conda activate $ENV_NAME"

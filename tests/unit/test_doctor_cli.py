@@ -12,6 +12,21 @@ from cspflow.config.schema import Machine
 
 runner = CliRunner()
 
+
+def output_of(result) -> str:
+    """stdout + stderr, whichever the installed click keeps them in.
+
+    click < 8.2 merged stderr into `result.output`; 8.2+ keeps them separate.
+    The suite has to pass in both the base env (click 8.1) and the cspflow env
+    (click 8.5), so tests never assume which stream an error landed in.
+    """
+    parts = [result.stdout or ""]
+    try:
+        parts.append(result.stderr or "")
+    except (ValueError, AttributeError):
+        pass
+    return "".join(parts)
+
 CAMPAIGN = """\
 name: t
 machine: local
@@ -141,7 +156,7 @@ def test_missing_potcar_root_is_a_clean_failure(campaign_file):
 
 def test_version():
     res = runner.invoke(app, ["version"])
-    assert res.exit_code == 0 and "cspflow" in res.stdout
+    assert res.exit_code == 0 and "cspflow" in output_of(res)
 
 
 def test_init_writes_a_valid_campaign(tmp_path):
@@ -173,12 +188,13 @@ def test_init_refuses_to_clobber(tmp_path):
 def test_config_show(campaign_file):
     res = runner.invoke(app, ["config", "show", "-c", str(campaign_file)])
     assert res.exit_code == 0
-    assert "config_hash" in res.stdout and "name: t" in res.stdout
+    out = output_of(res)
+    assert "config_hash" in out and "name: t" in out
 
 
 def test_config_show_origins(campaign_file):
     res = runner.invoke(app, ["config", "show", "-c", str(campaign_file), "--origins"])
-    assert res.exit_code == 0 and str(campaign_file) in res.stdout
+    assert res.exit_code == 0 and str(campaign_file) in output_of(res)
 
 
 def test_config_show_json(campaign_file):
@@ -186,19 +202,20 @@ def test_config_show_json(campaign_file):
 
     res = runner.invoke(app, ["config", "show", "-c", str(campaign_file), "--json"])
     assert res.exit_code == 0
-    payload = json.loads(res.stdout[: res.stdout.rindex("}") + 1])
+    out = output_of(res)
+    payload = json.loads(out[: out.rindex("}") + 1])
     assert payload["name"] == "t"
 
 
 def test_config_defaults_lists_schema_defaults():
     res = runner.invoke(app, ["config", "defaults"])
-    assert res.exit_code == 0 and "e_above_hull_max" in res.stdout
+    assert res.exit_code == 0 and "e_above_hull_max" in output_of(res)
 
 
 def test_set_flows_through_the_cli(campaign_file):
     res = runner.invoke(app, ["config", "show", "-c", str(campaign_file),
                               "-s", "filter.e_above_hull_max=0.33"])
-    assert res.exit_code == 0 and "0.33" in res.stdout
+    assert res.exit_code == 0 and "0.33" in output_of(res)
 
 
 def test_bad_config_exits_nonzero_with_a_message(tmp_path):
@@ -211,7 +228,7 @@ def test_bad_config_exits_nonzero_with_a_message(tmp_path):
 def test_status_without_a_database_is_a_clean_error(campaign_file):
     res = runner.invoke(app, ["status", "-c", str(campaign_file)])
     assert res.exit_code == 1
-    assert "no campaign database" in res.stdout
+    assert "no campaign database" in output_of(res)
 
 
 def test_doctor_exit_code_reflects_failure(campaign_file):
