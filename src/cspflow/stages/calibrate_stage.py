@@ -32,6 +32,7 @@ from ..calibrate.pilot import build_pilot_report, stratified_sample
 from ..db.store import Store, StructureState
 from ..reference.mp import ReferenceError, fetch_structures
 from .base import StageReport
+from .dedup_stage import CHECKED_KEY
 
 # Marks a structure as a member of the pilot set. Kept on the structure row
 # rather than in a side table so that `csp status --why` shows it, and so that
@@ -293,14 +294,21 @@ def _pilot_members(store: Store) -> list:
 
 
 def _selectable(store: Store) -> list:
-    """Screened candidates a pilot set could be drawn from.
+    """Deduplicated candidates a pilot set could be drawn from.
 
-    Deduplicated ones only: a pilot containing three settings of one structure
-    measures the model once and spends the DFT three times.
+    Deduplicated ones only, for two reasons. A pilot containing three settings
+    of one structure measures the model once and spends the DFT three times.
+    And the selection is meant to *span* the hull range -- which it cannot do
+    while dedup is still working, because the range it spans is then whatever
+    happened to be processed first.
+
+    So this returns nothing at all while anything is still waiting to be
+    deduplicated. The pilot is a one-shot decision that gates the whole
+    expensive tier; taking it against a partial set to save one cycle is a poor
+    trade.
     """
-    rows = [row for row in store.structures(state=StructureState.deduped.value)
+    rows = [row for row in store.structures(state=StructureState.screened.value)
             if row.key_value_pairs.get("mlip_e_per_atom") is not None]
-    if rows:
-        return rows
-    return [row for row in store.structures(state=StructureState.screened.value)
-            if row.key_value_pairs.get("mlip_e_per_atom") is not None]
+    if any(not row.key_value_pairs.get(CHECKED_KEY) for row in rows):
+        return []
+    return rows

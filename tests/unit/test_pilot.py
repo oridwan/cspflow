@@ -15,6 +15,7 @@ from cspflow.calibrate.pilot import (PilotError, build_pilot_report,
 from cspflow.config.loader import load_campaign
 from cspflow.db.store import Origin, Store, StructureState
 from cspflow.stages.calibrate_stage import PILOT_KEY, CalibrateStage
+from cspflow.stages.dedup_stage import CHECKED_KEY
 from cspflow.stages.dft_stage import DftStage
 
 CAMPAIGN = """\
@@ -49,12 +50,18 @@ def store(tmp_path):
         yield s
 
 
-def add(store, hull, state=StructureState.deduped, **kv):
+def add(store, hull, state=StructureState.screened, checked=True, **kv):
+    """A structure as it looks after screening and dedup.
+
+    `screened` with `dedup_checked`, which is what a *survivor* is: `deduped`
+    marks a structure removed as a duplicate.
+    """
     atoms = Atoms("Fe2Sm", positions=[(0, 0, 0), (1, 1, 1), (2, 2, 2)],
                   cell=[4, 4, 4], pbc=True)
     return store.add_structure(atoms, origin=Origin.generated, state=state,
                                mlip_e_per_atom=-7.0 - hull,
-                               e_above_hull_mlip=hull, **kv)
+                               e_above_hull_mlip=hull,
+                               **{CHECKED_KEY: checked}, **kv)
 
 
 # -- choosing the pilot ----------------------------------------------------
@@ -166,6 +173,17 @@ def test_the_stage_selects_a_pilot_set_and_sends_it_to_dft(make_cfg, store):
                for r in members)
 
 
+def test_a_pilot_is_not_chosen_while_dedup_is_still_working(make_cfg, store):
+    """The selection is meant to span the hull range, which it cannot do while
+    the range is still filling in. It is a one-shot decision that gates the
+    whole expensive tier; taking it early to save one cycle is a poor trade."""
+    for i in range(10):
+        add(store, hull=i * 0.02)
+    add(store, hull=0.5, checked=False)
+    CalibrateStage(make_cfg(n=4)).run(store)
+    assert not [r for r in store.structures() if r.key_value_pairs.get(PILOT_KEY)]
+
+
 def test_the_stage_waits_rather_than_judging_a_half_finished_pilot(make_cfg, store):
     for i in range(10):
         add(store, hull=i * 0.02)
@@ -208,7 +226,7 @@ def test_the_expensive_tier_is_held_until_the_pilot_reports(make_cfg, store):
     cfg = make_cfg(n=3)
     CalibrateStage(cfg).run(store)
     # Everything else is now selected for DFT too.
-    for row in store.structures(state=StructureState.deduped.value):
+    for row in store.structures(state=StructureState.screened.value):
         store.set_structure_state(int(row.id), StructureState.selected)
 
     dft = DftStage(cfg)
@@ -227,7 +245,7 @@ def test_the_barrier_opens_when_the_pilot_passes(make_cfg, store):
         store.set_structure_state(int(row.id), StructureState.dft_done,
                                   e_per_atom=row.key_value_pairs["mlip_e_per_atom"])
     stage.run(store)
-    for row in store.structures(state=StructureState.deduped.value):
+    for row in store.structures(state=StructureState.screened.value):
         store.set_structure_state(int(row.id), StructureState.selected)
     assert len(DftStage(cfg)._ready(store)) > 3
 
@@ -238,7 +256,7 @@ def test_a_failed_pilot_keeps_the_barrier_closed(make_cfg, store):
     cfg = make_cfg(n=3)
     store.add_calibration(kind="pilot", n_points=3, verdict="fail",
                           detail="the MLIP recovers none of DFT's best")
-    for row in store.structures(state=StructureState.deduped.value):
+    for row in store.structures(state=StructureState.screened.value):
         store.set_structure_state(int(row.id), StructureState.selected)
     assert DftStage(cfg)._ready(store) == []
 
@@ -257,6 +275,6 @@ def test_warn_reports_without_blocking(make_cfg, store):
         add(store, hull=i * 0.02)
     cfg = make_cfg(policy="warn", n=3)
     CalibrateStage(cfg).run(store)
-    for row in store.structures(state=StructureState.deduped.value):
+    for row in store.structures(state=StructureState.screened.value):
         store.set_structure_state(int(row.id), StructureState.selected)
     assert len(DftStage(cfg)._ready(store)) > 3

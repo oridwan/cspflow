@@ -29,6 +29,11 @@ from ..config.loader import ResolvedConfig
 from ..db.store import Origin, Store, StructureState
 from .base import StageReport
 
+# Set on every structure this stage has compared, survivor or duplicate. The
+# state alone cannot say so: a survivor stays `screened`, which is also what an
+# unexamined structure is.
+CHECKED_KEY = "dedup_checked"
+
 
 class DedupStage:
     name = "dedup"
@@ -52,9 +57,11 @@ class DedupStage:
         pass
 
     def run(self, store: Store) -> StageReport:
-        rows = self._eligible(store)
-        if not rows:
+        if not self._eligible(store):
             return StageReport(stage=self.name, note="nothing to compare")
+        # Compare over the whole pool, not only the new arrivals: a structure
+        # that duplicates one accepted three cycles ago is still a duplicate.
+        rows = self._pool(store)
 
         matcher = self._matcher()
         if matcher is None:                                # pragma: no cover
@@ -93,6 +100,13 @@ class DedupStage:
                     )
                     dropped += 1
 
+        # Mark everything that was compared, survivors included. A survivor
+        # keeps its `screened` state -- `filter` and `reference` read that, and
+        # `deduped` means "removed as a duplicate" -- but it must not be
+        # compared again.
+        for row in rows:
+            store.update_structure(int(row.id), **{CHECKED_KEY: True})
+
         note = f"{groups} duplicate group(s)"
         if kept_seeds:
             note += f", {kept_seeds} seed collision(s) reported and kept"
@@ -101,9 +115,28 @@ class DedupStage:
 
     # -- internals ---------------------------------------------------------
 
+    def _pool(self, store: Store) -> list[Any]:
+        """Everything a new arrival has to be compared *against*.
+
+        Survivors included: a structure that arrives in a later cycle and
+        duplicates one already accepted is still a duplicate.
+        """
+        return list(store.structures(state=StructureState.screened.value))
+
     def _eligible(self, store: Store) -> list[Any]:
-        return [r for r in store.structures(state=StructureState.screened.value)
-                if "duplicate_of" not in r.key_value_pairs]
+        """Structures not yet compared -- the actual work.
+
+        Distinct from `_pool` on purpose. `pending` counted the pool, so a
+        campaign whose structures were all unique reported work forever: the
+        driver never considered dedup finished (`csp run` without `--watch`
+        could not terminate) and the O(n^2) matching ran again over every
+        survivor on every cycle.
+
+        Found on the live campaign: 32 unique structures, "reconciled 32,
+        0 duplicate groups", every cycle, unchanged.
+        """
+        return [r for r in self._pool(store)
+                if not r.key_value_pairs.get(CHECKED_KEY)]
 
     def _matcher(self):
         try:

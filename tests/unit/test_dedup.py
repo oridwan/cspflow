@@ -118,13 +118,36 @@ class TestDedup:
         assert stage.run(store).claimed == 0
 
     def test_pending_falls_to_zero(self, cfg, store):
+        """Zero, not one.
+
+        `pending` used to return the whole comparison pool, so a survivor kept
+        it above zero forever: the driver never considered dedup finished, so
+        `csp run` without `--watch` could not terminate, and the O(n^2) matching
+        re-ran over every survivor on every cycle. Found on the live campaign --
+        32 unique structures, "reconciled 32, 0 duplicate groups", unchanged,
+        every cycle.
+        """
         fe = bulk("Fe", "bcc", a=2.87, cubic=True)
         add(store, fe, -8.9)
         add(store, fe.copy(), -8.0)
         stage = DedupStage(cfg)
         assert stage.pending(store) == 2
         stage.run(store)
-        assert stage.pending(store) == 1        # the survivor stays comparable
+        assert stage.pending(store) == 0
+
+    def test_a_later_arrival_is_still_compared_against_a_survivor(self, cfg, store):
+        """Which is why the comparison pool and the work list are different."""
+        fe = bulk("Fe", "bcc", a=2.87, cubic=True)
+        first = add(store, fe, -8.9)
+        stage = DedupStage(cfg)
+        stage.run(store)
+        assert stage.pending(store) == 0
+
+        late = add(store, fe.copy(), -8.0)
+        assert stage.pending(store) == 1
+        stage.run(store)
+        assert store.get_structure(late).key_value_pairs["state"] == "deduped"
+        assert store.get_structure(first).key_value_pairs["state"] == "screened"
 
     def test_nothing_to_compare(self, cfg, store):
         assert DedupStage(cfg).run(store).note == "nothing to compare"
