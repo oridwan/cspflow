@@ -316,10 +316,11 @@ class TestBudget:
 
 class TestLoop:
     def test_stops_when_no_work_remains(self, cfg, store):
+        """One cycle: the stage runs, reports 0 pending, and the loop concludes."""
         stage = FakeInProcessStage(work=2)
         d = driver(cfg, store, FakeScheduler(), [stage], stages=["filter"])
         reports = d.run(watch=False)
-        assert len(reports) == 2          # one that works, one that finds nothing
+        assert len(reports) == 1 and stage.ran == 1
 
     def test_max_cycles_caps_the_loop(self, cfg, store):
         d = driver(cfg, store, FakeScheduler(), [FakeStage(work=1000)],
@@ -353,3 +354,57 @@ class TestLoop:
         d = driver(cfg, store, FakeScheduler(), [FakeStage(work=5)], stages=["dft"])
         text = d.cycle().render()
         assert "cycle 1" in text and "dft" in text
+
+
+# --------------------------------------------------------------------------
+# The source stage, and the registry
+# --------------------------------------------------------------------------
+
+
+class TestSourceStage:
+    def test_is_in_process(self, cfg, store):
+        from cspflow.stages import SourceStage
+
+        assert SourceStage(cfg).in_process is True
+
+    def test_writes_composition_rows(self, cfg, store):
+        from cspflow.stages import SourceStage
+
+        stage = SourceStage(cfg)
+        assert stage.pending(store) == 1
+        report = stage.run(store)
+        assert report.claimed == 1                # FeCo5 at Z=1
+        assert store.chemsystems() == ["Co-Fe"]
+
+    def test_stops_being_pending_once_it_has_run(self, cfg, store):
+        """Otherwise the driver never concludes the campaign is finished."""
+        from cspflow.stages import SourceStage
+
+        stage = SourceStage(cfg)
+        stage.run(store)
+        assert stage.pending(store) == 0
+
+    def test_the_driver_runs_it_end_to_end(self, cfg, store):
+        from cspflow.stages import SourceStage
+
+        d = driver(cfg, store, FakeScheduler(), [SourceStage(cfg)], stages=["source"])
+        reports = d.run(watch=False)
+        assert store.compositions()
+        assert reports[0].stages[0].claimed == 1
+
+    def test_the_loop_does_not_sleep_after_finishing(self, cfg, store):
+        """`pending` was measured before the stage ran, so a finished stage
+        still looked pending and the driver slept a full interval."""
+        from cspflow.stages import SourceStage
+
+        d = driver(cfg, store, FakeScheduler(), [SourceStage(cfg)], stages=["source"])
+        report = d.cycle()
+        assert report.stages[0].pending == 0
+
+    def test_registry_lists_only_what_is_implemented(self, cfg):
+        from cspflow.stages import IMPLEMENTED, PLANNED, build_registry
+
+        names = [s.name for s in build_registry(cfg)]
+        assert names == IMPLEMENTED
+        assert set(names).isdisjoint(PLANNED)
+        assert set(IMPLEMENTED) | set(PLANNED) == set(STAGE_ORDER)

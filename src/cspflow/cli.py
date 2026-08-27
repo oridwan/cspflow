@@ -15,7 +15,10 @@ from .config.loader import ConfigError, load_campaign
 from .config.schema import Campaign
 from .db.store import Store, StoreError
 from .ingest import IngestError, ingest_campaign
+from .driver import STAGE_ORDER, Driver, DriverError, DriverOptions
+from .scheduler import for_machine
 from .source import SourceError, expand_all, write_plan
+from .stages import IMPLEMENTED, PLANNED, build_registry
 from .templates import scaffold
 
 app = typer.Typer(
@@ -256,6 +259,72 @@ def source(
 
 
 @app.command()
+def run(
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
+    set_: SetOpt = None,
+    through: Annotated[Optional[str], typer.Option("--through", help="run stages up to and including this one")] = None,
+    from_: Annotated[Optional[str], typer.Option("--from", help="run stages from this one on")] = None,
+    only: Annotated[Optional[str], typer.Option("--only", help="a single stage")] = None,
+    watch: Annotated[bool, typer.Option("--watch", help="keep cycling instead of stopping when idle")] = False,
+    interval: Annotated[int, typer.Option("--interval", help="seconds between cycles")] = 300,
+    max_cycles: Annotated[Optional[int], typer.Option("--max-cycles")] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="report what would be submitted, claim nothing")] = False,
+    db: Annotated[Optional[Path], typer.Option("--db")] = None,
+) -> None:
+    """The driver loop: reconcile what is in flight, submit what fits, repeat.
+
+    `--through calibrate` is Phase A -- cheap, run to completion for every
+    composition. `--from filter --watch` is Phase B -- expensive, streamed under
+    a core-hour budget. The two are the same loop over a different stage slice.
+    """
+    cfg = _load(campaign, set_)
+    base = Path(campaign).resolve().parent
+    target = db or _db_path(cfg)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    wanted = _stage_slice(through, from_, only)
+    runnable = [name for name in wanted if name in IMPLEMENTED]
+    skipped = [name for name in wanted if name not in IMPLEMENTED]
+    if skipped:
+        typer.secho(
+            "not yet implemented, skipped: "
+            + ", ".join(f"{n} ({PLANNED.get(n, '?')})" for n in skipped),
+            fg=typer.colors.YELLOW, err=True,
+        )
+    if not runnable:
+        _die("none of the requested stages are implemented yet")
+
+    store = Store.open(target) if target.is_file() else Store.create(
+        target, campaign=cfg.campaign.name, config_hash=cfg.config_hash
+    )
+    options = DriverOptions(interval=interval, max_cycles=max_cycles,
+                            stages=runnable, dry_run=dry_run)
+    with store:
+        try:
+            driver = Driver(cfg, store, for_machine(cfg.machine, dry_run=dry_run),
+                            build_registry(cfg, base), options,
+                            emit=lambda msg: typer.echo(msg))
+            driver.run(watch=watch)
+        except (DriverError, SourceError) as exc:
+            _die(str(exc))
+    typer.echo(f"\ndatabase {target}")
+
+
+def _stage_slice(through: str | None, from_: str | None, only: str | None) -> list[str]:
+    """Turn --through/--from/--only into a contiguous slice of the funnel."""
+    for name in (through, from_, only):
+        if name is not None and name not in STAGE_ORDER:
+            _die(f"unknown stage {name!r}; the funnel is {STAGE_ORDER}")
+    if only:
+        return [only]
+    start = STAGE_ORDER.index(from_) if from_ else 0
+    stop = STAGE_ORDER.index(through) + 1 if through else len(STAGE_ORDER)
+    if stop <= start:
+        _die(f"--from {from_} comes after --through {through}; that selects nothing")
+    return STAGE_ORDER[start:stop]
+
+
+@app.command()
 def status(
     campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
     set_: SetOpt = None,
@@ -283,6 +352,15 @@ def status(
             typer.echo("jobs")
             for state, n in sorted(s["jobs"].items()):
                 typer.echo(f"    {state:<16} {n}")
+            typer.echo(f"    {'core-hours':<16} {s['core_hours']:,.0f}")
+        if s["relaxations"]:
+            # Reported separately from job state on purpose: a VASP run that
+            # exits cleanly at the ionic step limit is `done` and NOT relaxed.
+            # 61% of redo-new-ter-mag was exactly that.
+            typer.echo("relaxations")
+            for key, n in sorted(s["relaxations"].items()):
+                flag = "   <- not usable as a relaxed geometry" if "not converged" in key else ""
+                typer.echo(f"    {key:<24} {n}{flag}")
 
 
 def _print_history(store: Store, sid: int) -> None:

@@ -302,3 +302,64 @@ def test_summary(store):
     s = store.summary()
     assert s["compositions"] == 1 and s["structures"] == 1
     assert s["structures_by_state"] == {"new": 1}
+
+
+class TestWalOrphans:
+    """A WAL left behind by a deleted database, which SQLite reports opaquely."""
+
+    def test_create_refuses_an_orphaned_wal(self, tmp_path):
+        from cspflow.db.store import Store, StoreError
+
+        db = tmp_path / "c.db"
+        (tmp_path / "c.db-wal").write_bytes(b"")
+        with pytest.raises(StoreError, match="write-ahead log"):
+            Store.create(db, campaign="t")
+
+    def test_open_refuses_an_orphaned_wal(self, tmp_path):
+        from cspflow.db.store import Store, StoreError
+
+        db = tmp_path / "c.db"
+        (tmp_path / "c.db-shm").write_bytes(b"")
+        with pytest.raises(StoreError, match="write-ahead log"):
+            Store.open(db)
+
+    def test_the_message_names_the_command_that_fixes_it(self, tmp_path):
+        from cspflow.db.store import Store, StoreError
+
+        db = tmp_path / "c.db"
+        (tmp_path / "c.db-wal").write_bytes(b"")
+        with pytest.raises(StoreError, match=r"rm -f .*c\.db-wal"):
+            Store.create(db, campaign="t")
+
+    def test_sidecars_alongside_a_real_database_are_fine(self, tmp_path):
+        """The guard fires on an ORPHANED wal, not on a live one."""
+        from cspflow.db.store import Store
+
+        db = tmp_path / "c.db"
+        db.write_bytes(b"")
+        (tmp_path / "c.db-wal").write_bytes(b"")
+        Store._check_sidecars(db)          # must not raise
+
+
+class TestRelaxationOutcomes:
+    def test_converged_and_not_are_reported_separately(self, tmp_path):
+        """A VASP run that exits at the ionic step limit is done, not relaxed."""
+        from cspflow.db.store import Store
+
+        with Store.create(tmp_path / "c.db", campaign="t") as s:
+            s.add_relaxation(structure_id=1, engine="vasp:relax", energy=-1.0, converged=True)
+            s.add_relaxation(structure_id=2, engine="vasp:relax", energy=-2.0, converged=False)
+            s.add_relaxation(structure_id=3, engine="vasp:relax", energy=-3.0, converged=False)
+            outcomes = s.relaxation_outcomes()
+        assert outcomes == {"vasp:relax:converged": 1, "vasp:relax:not converged": 2}
+
+    def test_summary_carries_the_split_and_the_core_hours(self, tmp_path):
+        from cspflow.db.store import Store
+
+        with Store.create(tmp_path / "c.db", campaign="t") as s:
+            jid = s.add_job(stage="dft", structure_id=1)
+            s.update_job(jid, state="done", core_hours=12.5)
+            s.add_relaxation(structure_id=1, engine="vasp:relax", converged=False)
+            summary = s.summary()
+        assert summary["core_hours"] == 12.5
+        assert summary["relaxations"] == {"vasp:relax:not converged": 1}

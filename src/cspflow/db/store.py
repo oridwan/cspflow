@@ -173,10 +173,35 @@ class Store:
         """
         return ase_connect(str(self.path), serial=True)
 
+    @staticmethod
+    def _check_sidecars(path: Path) -> None:
+        """Refuse an orphaned WAL, with the fix named.
+
+        The database runs in WAL mode, so it is really three files: `x.db`,
+        `x.db-wal` and `x.db-shm`. Deleting only `x.db` -- the obvious way to
+        start a campaign over -- leaves the other two, and SQLite then fails
+        with a bare
+
+            OperationalError: disk I/O error
+
+        which says nothing whatever about the cause. Hit while testing `csp run`
+        after `rm -f campaign.db`, which is exactly what a user would type.
+        """
+        orphans = [p for p in (Path(f"{path}-wal"), Path(f"{path}-shm")) if p.exists()]
+        if orphans and not path.exists():
+            names = ", ".join(p.name for p in orphans)
+            raise StoreError(
+                f"{path} does not exist but its write-ahead log does ({names}). "
+                f"SQLite reports this as a bare 'disk I/O error'. The database is "
+                f"three files in WAL mode; remove the leftovers too:\n"
+                f"    rm -f {path}-wal {path}-shm"
+            )
+
     @classmethod
     def create(cls, path: str | Path, *, campaign: str, config_hash: str = "") -> "Store":
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        cls._check_sidecars(path)
         store = cls(path)
         store.sql.executescript(SCHEMA_PATH.read_text())
         # Touch the ASE side so both halves exist from the start; otherwise the
@@ -191,6 +216,7 @@ class Store:
     @classmethod
     def open(cls, path: str | Path) -> "Store":
         path = Path(path)
+        cls._check_sidecars(path)
         if not path.is_file():
             raise StoreError(f"no campaign database at {path}. Run `csp init` first.")
         store = cls(path)
@@ -607,4 +633,24 @@ class Store:
                     "SELECT value AS state, COUNT(*) n FROM text_key_values "
                     "WHERE key='state' GROUP BY value")
             },
+            "relaxations": self.relaxation_outcomes(),
+            "core_hours": float(self.sql.execute(
+                "SELECT COALESCE(SUM(core_hours), 0.0) h FROM job").fetchone()["h"]),
         }
+
+    def relaxation_outcomes(self) -> dict[str, int]:
+        """Converged vs. not, per engine -- never folded into a single "done".
+
+        This is D027 surfaced where a user will actually see it. Over 106 jobs
+        in `redo-new-ter-mag`, 100% exited cleanly and only 39% reached required
+        accuracy; a status line reading "106 done" describes the process
+        faithfully and the science not at all.
+        """
+        out: dict[str, int] = {}
+        for row in self.sql.execute(
+            "SELECT engine, converged, COUNT(*) n FROM relaxation "
+            "GROUP BY engine, converged ORDER BY engine"
+        ):
+            key = f"{row['engine']}:{'converged' if row['converged'] else 'not converged'}"
+            out[key] = row["n"]
+        return out

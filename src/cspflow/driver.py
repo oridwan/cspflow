@@ -327,6 +327,12 @@ class Driver:
             out.claimed = done.claimed
             out.reconciled = done.reconciled
             out.note = done.note
+            # Re-read: `pending` was measured before the stage ran, and the loop
+            # decides whether to sleep by asking whether work remains. Left
+            # stale, an in-process stage that finished its work in this very
+            # cycle still reported it as pending, and the driver slept a full
+            # interval before noticing it was done.
+            out.pending = stage.pending(self.store)
             return out
 
         if report.budget_exhausted:
@@ -356,6 +362,7 @@ class Driver:
 
         items = stage.claim(self.store, budget)
         out.claimed = len(items)
+        out.pending = stage.pending(self.store)
         if not items:
             return out
 
