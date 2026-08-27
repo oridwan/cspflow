@@ -12,20 +12,20 @@ from pathlib import Path
 
 from ..config.loader import ResolvedConfig
 from .base import Stage, StageReport, WorkItem
+from .reference_stage import ReferenceStage
 from .screen_stage import ScreenStage
 from .source_stage import SourceStage
 
-__all__ = ["Stage", "StageReport", "WorkItem", "ScreenStage", "SourceStage",
+__all__ = ["Stage", "StageReport", "WorkItem", "ReferenceStage", "ScreenStage", "SourceStage",
            "build_registry", "IMPLEMENTED", "PLANNED"]
 
 # What exists today, in funnel order.
-IMPLEMENTED = ["source", "screen"]
+IMPLEMENTED = ["source", "screen", "reference"]
 
 # What does not, and which milestone brings it. Named here so `csp run` can say
 # "screen arrives in M1" rather than "unknown stage".
 PLANNED = {
     "generate": "M3",
-    "reference": "M1",
     "calibrate": "M1",
     "filter": "M1",
     "dft": "M2",
@@ -35,4 +35,4 @@ PLANNED = {
 
 def build_registry(cfg: ResolvedConfig, base_dir: Path | None = None) -> list[Stage]:
     """Every stage that has an implementation, given this configuration."""
-    return [SourceStage(cfg, base_dir), ScreenStage(cfg)]
+    return [SourceStage(cfg, base_dir), ScreenStage(cfg), ReferenceStage(cfg)]

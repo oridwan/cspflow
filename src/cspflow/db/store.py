@@ -477,13 +477,38 @@ class Store:
         ).fetchone()
         return int(row["id"])
 
-    def reference_entries(self, *, chemsys: str | None = None) -> list[sqlite3.Row]:
+    def reference_entries(
+        self, *, chemsys: str | None = None, include_subsystems: bool = False
+    ) -> list[sqlite3.Row]:
+        """Reference phases, optionally including every sub-system.
+
+        `include_subsystems` matters more than it looks, and defaults to False
+        only because an exact-match query is the less surprising default.
+
+        An elemental Fe entry's `chemsys` is `'Fe'`, not `'Fe-Sm'`. So
+        `reference_entries(chemsys='Fe-Sm')` returns the binary compounds and
+        **no elemental references at all** -- which is precisely the set the
+        hull's elemental guard (D058) refuses, and precisely the trap D061 had
+        to fix at the MP API level. It reappears here because the database
+        stores each entry under its own chemical system, correctly.
+
+        Anything building a hull wants `include_subsystems=True`.
+        """
         q = "SELECT * FROM reference_entry"
         args: list[Any] = []
         if chemsys is not None:
-            q += " WHERE chemsys=?"
-            args.append(chemsys)
+            wanted = self._subsystems(chemsys) if include_subsystems else [chemsys]
+            q += f" WHERE chemsys IN ({','.join('?' * len(wanted))})"
+            args.extend(wanted)
         return list(self.sql.execute(q + " ORDER BY id", args))
+
+    @staticmethod
+    def _subsystems(chemsys: str) -> list[str]:
+        from itertools import combinations
+
+        elements = sorted(e for e in chemsys.split("-") if e)
+        return ["-".join(c) for n in range(1, len(elements) + 1)
+                for c in combinations(elements, n)]
 
     def assert_single_thermo_type(self) -> str:
         """MP silently mixes functionals; a reference set may contain only one.
