@@ -41,7 +41,7 @@ from .stages.base import Stage, StageReport, WorkItem
 # Stage order is the funnel order.  `--through` and `--from` slice this list,
 # which is what makes Phase A a barrier and Phase B a stream (pipeline.md 4.3).
 STAGE_ORDER = [
-    "source", "generate", "screen", "reference", "calibrate",
+    "source", "generate", "screen", "dedup", "reference", "calibrate",
     "filter", "dft", "analyze",
 ]
 
