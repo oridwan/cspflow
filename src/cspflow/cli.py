@@ -325,6 +325,38 @@ def _stage_slice(through: str | None, from_: str | None, only: str | None) -> li
     return STAGE_ORDER[start:stop]
 
 
+@app.command()
+def recipe(
+    name: Annotated[str, typer.Argument(help="shipped recipe name or a path")] = "magnets",
+) -> None:
+    """Print a recipe fully resolved -- every tag literal, nothing deferred.
+
+    This is what `inherit:` copying buys: there is no value here whose meaning
+    requires knowing pymatgen to predict.
+    """
+    from .dft.recipe import RecipeError, load_recipe, validate_recipe
+    from .dft.vasp.incar import render_incar
+
+    try:
+        loaded = load_recipe(name)
+        warnings = validate_recipe(loaded)
+    except RecipeError as exc:
+        _die(str(exc))
+
+    typer.echo(f"recipe {loaded.name}  ({loaded.source})")
+    for stage in loaded.stages:
+        typer.echo(f"\n=== {stage.name} ===")
+        typer.echo(render_incar(stage.incar).rstrip())
+        typer.echo(f"kpoints   {stage.kpoints.as_dict()}")
+        typer.echo(f"resources {stage.resources}")
+        if stage.retry:
+            typer.echo(f"retry     {[r.get('when') for r in stage.retry]}")
+    typer.echo("\n# MAGMOM, NBANDS, LMAXMIX, SYSTEM and LDAU* are computed per")
+    typer.echo("# structure and written into the emitted INCAR.")
+    for w in warnings:
+        typer.secho(f"warning: {w}", fg=typer.colors.YELLOW, err=True)
+
+
 @app.command("screen-worker", hidden=True)
 def screen_worker(
     manifest: Annotated[Path, typer.Option("--manifest", help="written by the screen stage")],
