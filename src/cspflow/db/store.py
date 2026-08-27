@@ -30,6 +30,16 @@ SCHEMA_VERSION = "1"
 # says what to do instead.
 _ASE_SCALARS = (str, int, float, bool)
 
+# ASE also reserves key *names*: every element symbol plus about forty of its own
+# row attributes (`formula`, `energy`, `magmom`, `natoms`, `id`, `user`, `age`,
+# `fmax`, ...).  Writing one raises a bare `ValueError: Bad key: formula` from
+# four frames inside ASE, which says nothing about why a perfectly ordinary word
+# is not allowed -- so the check is hoisted here, where the reason can be given.
+try:                                                     # pragma: no cover - ASE layout
+    from ase.db.core import reserved_keys as _ASE_RESERVED
+except ImportError:                                      # pragma: no cover
+    _ASE_RESERVED = frozenset()
+
 
 class StoreError(Exception):
     """Anything wrong with the campaign database."""
@@ -92,8 +102,35 @@ def _clean_kv(kv: dict[str, Any]) -> dict[str, Any]:
                 f"str/int/float/bool; put structured values in the `data=` blob instead "
                 f"(they round-trip, but are not queryable)."
             )
+        if key in _ASE_RESERVED:
+            raise StoreError(
+                f"key {key!r} is reserved by ASE (it reserves every element symbol "
+                f"plus its own row attributes such as formula/energy/magmom/natoms/"
+                f"id/user). Writing it raises `ValueError: Bad key: {key}` from inside "
+                f"ASE. Prefix or qualify the name -- e.g. 'reduced_formula', "
+                f"'vasp_energy' -- so it cannot collide with a column ASE owns."
+            )
+        if _looks_like_a_formula(key):
+            raise StoreError(
+                f"key {key!r} parses as a chemical formula. ASE warns about this rather "
+                f"than refusing it, and the consequence is silent: db.select({key!r}) "
+                f"returns rows CONTAINING those elements, not rows carrying this key, so "
+                f"the query looks like it works and returns the wrong set. Rename the key."
+            )
         out[key] = value
     return out
+
+
+def _looks_like_a_formula(key: str) -> bool:
+    try:
+        from ase.formula import Formula
+    except ImportError:                                  # pragma: no cover
+        return False
+    try:
+        Formula(key, strict=True)
+    except (ValueError, KeyError):
+        return False
+    return True
 
 
 def _git_sha(repo: Path | None = None) -> str:

@@ -15,6 +15,7 @@ from .config.loader import ConfigError, load_campaign
 from .config.schema import Campaign
 from .db.store import Store, StoreError
 from .ingest import IngestError, ingest_campaign
+from .source import SourceError, expand_all, write_plan
 from .templates import scaffold
 
 app = typer.Typer(
@@ -198,6 +199,60 @@ def ingest(
             _die(str(exc))
     typer.echo(stats.render())
     typer.echo(f"\nwrote {target}")
+
+
+@app.command()
+def source(
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
+    set_: SetOpt = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="print the plan, write nothing")] = False,
+    db: Annotated[Optional[Path], typer.Option("--db", help="write here instead of the campaign workdir")] = None,
+    gpu_seconds: Annotated[float, typer.Option("--gpu-seconds", help="seconds per generated structure, for the time estimate")] = 0.0,
+    limit: Annotated[Optional[int], typer.Option("--limit", "-n", help="commit only the first N composition rows")] = None,
+) -> None:
+    """Stage 0 -- expand `source:` into composition and seed rows.
+
+    Enumeration happens entirely in memory and the plan is printed before
+    anything is written, so `--dry-run` runs the identical code path and the
+    estimate you approve is produced by the code that then does the work.
+
+    `--limit` truncates the committed rows, which is what makes a large chemical
+    space quick to sanity-check: the full enumeration is still reported, only the
+    commit is capped.
+    """
+    cfg = _load(campaign, set_)
+    base = Path(campaign).resolve().parent
+
+    try:
+        plan = expand_all(cfg.campaign, base)
+    except SourceError as exc:
+        _die(str(exc))
+
+    typer.echo(plan.render(gpu_seconds_per_structure=gpu_seconds or None))
+
+    if dry_run:
+        typer.echo("\n--dry-run: nothing written")
+        return
+
+    if limit is not None:
+        for result in plan.results:
+            result.compositions = result.compositions[:limit]
+
+    target = db or _db_path(cfg)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    store = Store.open(target) if target.is_file() else Store.create(
+        target, campaign=cfg.campaign.name, config_hash=cfg.config_hash
+    )
+    with store:
+        store.add_provenance(
+            config_hash=cfg.config_hash,
+            machine=str(cfg.machine_path),
+            resolved_config=cfg.campaign.model_dump(mode="json"),
+        )
+        stats = write_plan(plan, store)
+    typer.echo("")
+    typer.echo(stats.render())
+    typer.echo(f"wrote {target}")
 
 
 @app.command()

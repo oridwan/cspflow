@@ -236,3 +236,96 @@ def test_doctor_exit_code_reflects_failure(campaign_file):
     res = runner.invoke(app, ["doctor", "-c", str(campaign_file),
                               "-s", "workdir=/nonexistent-root/x"])
     assert res.exit_code == 1
+
+
+# --------------------------------------------------------------------------
+# `csp source`
+# --------------------------------------------------------------------------
+
+
+SWEEP_CAMPAIGN = """\
+name: t
+machine: local
+workdir: {workdir}
+source:
+  - mode: chemical_space
+    name: sweep
+    chemical_space:
+      groups:
+        R: {{elements: [Sm], pick: 1}}
+        T: {{elements: [Fe, Co], pick: 1, min_fraction: 0.8}}
+      max_atoms_formula: 12
+    defaults:
+      max_atoms: 24
+generate:
+  engine: mattergen
+  mattergen: {{model: /tmp/model}}
+"""
+
+
+@pytest.fixture
+def sweep_campaign(tmp_path):
+    path = tmp_path / "campaign.yaml"
+    path.write_text(SWEEP_CAMPAIGN.format(workdir=tmp_path))
+    return path
+
+
+class TestSourceCommand:
+    def test_dry_run_writes_nothing(self, sweep_campaign, tmp_path):
+        result = runner.invoke(app, ["source", "-c", str(sweep_campaign), "--dry-run"])
+        assert result.exit_code == 0, output_of(result)
+        assert "nothing written" in output_of(result)
+        assert not (tmp_path / "campaign.db").exists()
+
+    def test_dry_run_reports_the_work_before_it_is_done(self, sweep_campaign):
+        result = runner.invoke(
+            app, ["source", "-c", str(sweep_campaign), "--dry-run", "--gpu-seconds", "3"]
+        )
+        text = output_of(result)
+        assert "compositions" in text
+        assert "chemical systems" in text
+        assert "implied GPU time" in text
+
+    def test_commit_writes_rows(self, sweep_campaign, tmp_path):
+        db = tmp_path / "out.db"
+        result = runner.invoke(app, ["source", "-c", str(sweep_campaign), "--db", str(db)])
+        assert result.exit_code == 0, output_of(result)
+        assert db.is_file()
+        from cspflow.db.store import Store
+
+        with Store.open(db) as store:
+            assert store.compositions()
+            assert store.chemsystems() == ["Co-Sm", "Fe-Sm"]
+
+    def test_limit_caps_the_commit_not_the_report(self, sweep_campaign, tmp_path):
+        db = tmp_path / "out.db"
+        result = runner.invoke(
+            app, ["source", "-c", str(sweep_campaign), "--db", str(db), "--limit", "3"]
+        )
+        assert result.exit_code == 0, output_of(result)
+        from cspflow.db.store import Store
+
+        with Store.open(db) as store:
+            assert len(store.compositions()) == 3
+        assert "wrote 3 composition rows" in output_of(result)
+
+    def test_commit_records_provenance(self, sweep_campaign, tmp_path):
+        db = tmp_path / "out.db"
+        runner.invoke(app, ["source", "-c", str(sweep_campaign), "--db", str(db)])
+        from cspflow.db.store import Store
+
+        with Store.open(db) as store:
+            rows = store.sql.execute("SELECT config_hash FROM provenance").fetchall()
+        assert rows and rows[0]["config_hash"]
+
+    def test_bad_source_exits_non_zero_with_the_reason(self, tmp_path):
+        path = tmp_path / "campaign.yaml"
+        path.write_text(
+            "name: t\nmachine: local\nworkdir: %s\n"
+            "source:\n  - mode: composition_list\n    name: l\n"
+            "    composition_list: {items: [{formula: Xx2O3}]}\n"
+            "generate: {engine: mattergen, mattergen: {model: /tmp/m}}\n" % tmp_path
+        )
+        result = runner.invoke(app, ["source", "-c", str(path), "--dry-run"])
+        assert result.exit_code == 1
+        assert "not an element" in output_of(result)

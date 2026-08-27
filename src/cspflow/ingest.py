@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
+from . import chem
 from .db.store import Origin, Store, StructureState
 from .dft.vasp.parse import JobOutcome, read_job_directory
 
@@ -82,23 +83,17 @@ class IngestStats:
 def parse_formula(formula: str) -> tuple[str, dict[str, int]]:
     """`Gd1Co10Cr2` -> ('Co-Cr-Gd', {'Gd':1,'Co':10,'Cr':2}).
 
-    Written by hand rather than via pymatgen so that ingest works in an
-    environment without it, and so a malformed directory name produces a
-    skipped-with-reason rather than an exception from a third-party parser.
+    A thin wrapper over `cspflow.chem` that converts a parse failure into
+    `IngestError`.  Ingest walks a directory tree nobody curated, so a name it
+    cannot understand must become a skipped-with-reason rather than an exception
+    that ends the walk -- the opposite of Stage 0's composition list, where an
+    unparseable formula is a mistake the user wants raised immediately.
     """
-    counts: dict[str, int] = {}
-    pos, n = 0, len(formula)
-    while pos < n:
-        m = re.match(r"([A-Z][a-z]?)(\d*)", formula[pos:])
-        if not m or not m.group(1):
-            raise IngestError(f"cannot parse formula {formula!r} at position {pos}")
-        element = m.group(1)
-        count = int(m.group(2)) if m.group(2) else 1
-        counts[element] = counts.get(element, 0) + count
-        pos += m.end()
-    if not counts:
-        raise IngestError(f"no elements in formula {formula!r}")
-    return "-".join(sorted(counts)), counts
+    try:
+        counts = chem.parse_formula(formula)
+    except chem.ChemError as exc:
+        raise IngestError(str(exc)) from exc
+    return chem.chemsys(counts), counts
 
 
 def find_job_dirs(structure_dir: Path) -> list[Path]:
@@ -145,7 +140,11 @@ def ingest_campaign(
         except IngestError as exc:
             stats.skipped.append(f"{formula}: {exc}")
             continue
-        formula_atoms = sum(counts.values())
+        reduced, _ = chem.reduce_counts(counts)
+        canonical = chem.canonical_formula(reduced)
+        # Z counts copies of the REDUCED formula, matching Stage 0, so a legacy
+        # `Fe2Co10` directory and a generated `Co5Fe1` land on the same row.
+        formula_atoms = sum(reduced.values())
         stats.formulas += 1
         if progress:
             progress(formula)
@@ -162,8 +161,14 @@ def ingest_campaign(
 
             n_atoms = last.n_atoms or formula_atoms
             z = max(1, round(n_atoms / formula_atoms)) if formula_atoms else 1
+            # The directory name is provenance, not an identity: `Gd1Co10Cr2`
+            # and `Co10Cr2Gd1` are one composition, and `composition` is unique
+            # on (formula, z, source_name).  Storing the name as written would
+            # split one material across two rows and make every per-composition
+            # count downstream wrong, so the canonical form is the key and the
+            # name as written is kept on the structure row as `formula_dir`.
             comp_id = store.add_composition(
-                formula=formula, chemsys=chemsys, z=z, n_atoms=n_atoms,
+                formula=canonical, chemsys=chemsys, z=z, n_atoms=n_atoms,
                 n_target=len(structure_dirs), source_mode="ingest",
                 source_name=source_name, state="generated",
             )
