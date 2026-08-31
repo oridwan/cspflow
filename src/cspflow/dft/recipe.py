@@ -166,11 +166,20 @@ class Recipe:
         return [s.name for s in self.stages]
 
 
-def load_recipe(name_or_path: str) -> Recipe:
-    """Load a shipped recipe by name, or any YAML file by path."""
+def load_recipe(name_or_path: str, base_dir: Path | None = None) -> Recipe:
+    """Load a shipped recipe by name, or any YAML file by path.
+
+    A relative path is resolved against the campaign folder first, so
+    `recipe: recipe.yaml` means the campaign's own editable copy rather than
+    something in the working directory.
+    """
     path = Path(name_or_path)
     if not path.suffix:
         path = RECIPE_DIR / f"{name_or_path}.yaml"
+    elif not path.is_absolute() and base_dir is not None and not path.is_file():
+        candidate = base_dir / path
+        if candidate.is_file():
+            path = candidate
     if not path.is_file():
         shipped = sorted(p.stem for p in RECIPE_DIR.glob("*.yaml"))
         raise RecipeError(

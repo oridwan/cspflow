@@ -183,12 +183,22 @@ def test_init_writes_a_valid_campaign(tmp_path):
     assert cfg.campaign.name == "demo"
 
 
-def test_init_full_is_also_valid(tmp_path):
-    """The Tier-2 block is commented out, so it must not break parsing."""
+def test_init_writes_the_knobs_alongside(tmp_path):
+    """The tunable keys ship commented out, so they must not break parsing."""
     out = tmp_path / "c.yaml"
-    res = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local", "--full"])
+    res = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local"])
     assert res.exit_code == 0
-    assert "Tier 2" in out.read_text()
+    text = out.read_text()
+    assert "#   max_per_composition: 5" in text      # a knob you might reach for
+    assert "# 4. REFERENCE" in text                  # findable by funnel stage
+    load_campaign(out, sets=[f"workdir={tmp_path}"])
+
+
+def test_init_minimal_drops_the_annotations(tmp_path):
+    out = tmp_path / "c.yaml"
+    res = runner.invoke(app, ["init", "demo", "-o", str(out), "-m", "local", "--minimal"])
+    assert res.exit_code == 0
+    assert "# 4. REFERENCE" not in out.read_text()
     load_campaign(out, sets=[f"workdir={tmp_path}"])
 
 

@@ -57,7 +57,7 @@ class DftStage:
 
     def __init__(self, cfg: ResolvedConfig, recipe: Recipe | None = None) -> None:
         self.cfg = cfg
-        self.recipe = recipe or load_recipe(cfg.campaign.dft.recipe)
+        self.recipe = recipe or load_recipe(cfg.campaign.dft.recipe, cfg.base_dir)
 
     # -- what is ready -----------------------------------------------------
 

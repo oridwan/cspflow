@@ -185,7 +185,7 @@ def _campaign_encut(cfg: ResolvedConfig) -> float | None:
     try:
         from .dft.recipe import load_recipe
 
-        recipe = load_recipe(cfg.campaign.dft.recipe)
+        recipe = load_recipe(cfg.campaign.dft.recipe, cfg.base_dir)
     except Exception:
         return None
     # The lowest ENCUT any step would use: a static step at a lower cutoff than

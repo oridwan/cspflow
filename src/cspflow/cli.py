@@ -11,16 +11,17 @@ import typer
 import yaml
 
 from . import __version__, doctor as doctor_mod
-from .config.loader import ConfigError, load_campaign
+from .config.loader import ConfigError, load_campaign, resolve_machine_path
 from .config.schema import Campaign
 from .db.store import Store, StoreError
 from .ingest import IngestError, ingest_campaign
+from .legacy import REGISTRY as LEGACY_REGISTRY, LegacyError, adopt as adopt_legacy
 from .driver import STAGE_ORDER, Driver, DriverError, DriverOptions
 from .scheduler import for_machine
 from .source import SourceError, expand_all, write_plan
 from .stages import IMPLEMENTED, PLANNED, build_registry
 from .worker import WorkerError, run_generate_task, run_screen_task
-from .templates import scaffold
+from . import templates
 
 app = typer.Typer(
     name="csp",
@@ -46,11 +47,46 @@ def _die(message: str) -> None:
     raise typer.Exit(code=1)
 
 
+def _find_campaign(path: Path) -> Path:
+    """Locate the campaign file, walking up from the working directory.
+
+    A campaign is a folder, so every command should work from inside it or from
+    any folder beneath it -- the way git works anywhere in a checkout. Only the
+    unqualified default name is searched for; if the user named a file, that is
+    the file, and a missing one is an error rather than a hunt.
+    """
+    if path.is_file() or path.is_absolute() or str(path) != DEFAULT_CAMPAIGN:
+        return path
+    here = Path.cwd()
+    for folder in here.parents:
+        candidate = folder / DEFAULT_CAMPAIGN
+        if candidate.is_file():
+            typer.secho(f"# campaign: {candidate}", fg=typer.colors.BLUE, err=True)
+            return candidate
+    return path
+
+
 def _load(campaign: Path, sets: list[str] | None, machine: str | None = None):
     try:
-        return load_campaign(campaign, sets=sets, machine=machine)
+        return load_campaign(_find_campaign(campaign), sets=sets, machine=machine)
     except ConfigError as exc:
         _die(str(exc))
+
+
+def _link_results(campaign_file: Path, workdir: Path) -> None:
+    """Put a `results` symlink beside campaign.yaml pointing at the workdir.
+
+    Output lives on scratch because it gets large, which normally means the
+    config and the thing it produced are in two unrelated corners of the
+    filesystem. One symlink keeps them one `cd` apart.
+    """
+    link = _find_campaign(campaign_file).resolve().parent / "results"
+    if link.exists() or link.is_symlink():
+        return
+    try:
+        link.symlink_to(workdir, target_is_directory=True)
+    except OSError:
+        pass          # a read-only or exotic filesystem is not a reason to stop
 
 
 def _db_path(cfg) -> Path:
@@ -69,21 +105,85 @@ def version() -> None:
 @app.command()
 def init(
     name: Annotated[str, typer.Argument(help="campaign name")],
-    out: Annotated[Path, typer.Option("--out", "-o", help="where to write the campaign file")] = Path(DEFAULT_CAMPAIGN),
-    machine: Annotated[str, typer.Option("--machine", "-m")] = "orion",
-    full: Annotated[bool, typer.Option("--full", help="include commented Tier-2 knobs")] = False,
-    force: Annotated[bool, typer.Option("--force", help="overwrite an existing file")] = False,
+    directory: Annotated[Optional[Path], typer.Option("--dir", "-d", help="where to create it (default: ./<name>)")] = None,
+    machine: Annotated[str, typer.Option("--machine", "-m", help="shipped profile to copy: orion, generic_slurm, local")] = "orion",
+    recipe: Annotated[str, typer.Option("--recipe", help="shipped DFT recipe to copy")] = "magnets",
+    here: Annotated[bool, typer.Option("--here", help="use the current folder instead of creating one")] = False,
+    minimal: Annotated[bool, typer.Option("--minimal", help="campaign.yaml only, referring to the shipped profile and recipe")] = False,
+    out: Annotated[Optional[Path], typer.Option("--out", "-o", help="write just the campaign file, at this path")] = None,
+    force: Annotated[bool, typer.Option("--force", help="overwrite existing files")] = False,
 ) -> None:
-    """Write a starter campaign file.
+    """Create a campaign folder with every knob in it.
 
-    Emits only the ~10 Tier-1 keys by default; `--full` adds the commonly tuned
-    Tier-2 knobs, commented out with their defaults shown.
+    A campaign is a folder, not a file. Alongside campaign.yaml this puts your
+    own copy of the machine profile and the DFT recipe -- the two things that
+    used to be buried in site-packages where they could be neither found nor
+    edited -- plus an inputs/ folder for your own structures. Nothing here is
+    read-only and nothing is hidden: `--minimal` opts back out to a single file
+    that refers to the shipped profile and recipe by name.
     """
-    if out.exists() and not force:
-        _die(f"{out} already exists (use --force to overwrite)")
-    out.write_text(scaffold(name=name, machine=machine, full=full))
-    typer.echo(f"wrote {out}")
-    typer.echo("Next: edit it, then run `csp doctor`.")
+    from .dft.recipe import RECIPE_DIR
+
+    if out is not None:                     # single-file mode
+        if out.exists() and not force:
+            _die(f"{out} already exists (use --force to overwrite)")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(templates.campaign_yaml(name=name, machine=machine,
+                                               recipe=recipe, minimal=minimal))
+        typer.echo(f"wrote {out}")
+        typer.echo("Next: edit it, then run `csp doctor`.")
+        return
+
+    root = Path.cwd() if here else (directory or Path(name))
+    written: list[Path] = []
+
+    def _write(rel: str, text: str) -> None:
+        path = root / rel
+        if path.exists() and not force:
+            _die(f"{path} already exists (use --force to overwrite)")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        written.append(path)
+
+    if minimal:
+        _write(DEFAULT_CAMPAIGN, templates.campaign_yaml(
+            name=name, machine=machine, recipe=recipe, minimal=True))
+    else:
+        try:
+            machine_src = resolve_machine_path(machine)
+        except ConfigError as exc:
+            _die(str(exc))
+        recipe_src = RECIPE_DIR / f"{recipe}.yaml"
+        if not recipe_src.is_file():
+            shipped = sorted(f.stem for f in RECIPE_DIR.glob("*.yaml"))
+            _die(f"unknown recipe {recipe!r}; shipped: {shipped}")
+
+        _write(DEFAULT_CAMPAIGN, templates.campaign_yaml(
+            name=name, machine="machine.yaml", recipe="recipe.yaml"))
+        _write("machine.yaml", templates.machine_copy(machine_src, name=name))
+        _write("recipe.yaml", templates.recipe_copy(recipe_src, name=name))
+        _write("inputs/README.md", templates.inputs_readme())
+        _write("README.md", templates.workspace_readme(name=name))
+
+    typer.secho(f"\ncampaign {name} in {root}/", fg=typer.colors.GREEN, bold=True)
+    for path in written:
+        rel = path.relative_to(root)
+        typer.echo(f"  {str(rel):<18} {_BLURB.get(str(rel), '')}")
+    typer.echo("\nNext:")
+    if not here:
+        typer.echo(f"  cd {root}")
+    typer.echo("  $EDITOR campaign.yaml     # elements, cutoffs, how many structures")
+    typer.echo("  csp doctor                # check the machine before submitting anything")
+    typer.echo("  csp source --dry-run      # what would be searched")
+
+
+_BLURB = {
+    DEFAULT_CAMPAIGN: "what to search, and how hard",
+    "machine.yaml": "partitions, walltime, modules, VASP, POTCARs",
+    "recipe.yaml": "the DFT ladder: INCAR, k-points, resources",
+    "inputs/README.md": "your own structures and composition lists go here",
+    "README.md": "what to edit, what to run",
+}
 
 
 @config_app.command("show")
@@ -183,6 +283,7 @@ def ingest(
     cfg = _load(campaign, set_)
     target = db or _db_path(cfg)
     target.parent.mkdir(parents=True, exist_ok=True)
+    _link_results(Path(campaign), Path(cfg.campaign.workdir))
 
     store = Store.open(target) if target.is_file() else Store.create(
         target, campaign=cfg.campaign.name, config_hash=cfg.config_hash
@@ -206,6 +307,50 @@ def ingest(
 
 
 @app.command()
+def adopt(
+    flow: Annotated[str, typer.Argument(help=f"which legacy campaign: {', '.join(LEGACY_REGISTRY)}, or 'all'")],
+    dest: Annotated[Path, typer.Option("--dest", help="where the campaign directories go")] = Path("/scratch/$USER/cspflow_results"),
+    staging: Annotated[Optional[Path], typer.Option("--staging", help="build here first, then move (SQLite on NFS commits ~15x slower)")] = Path("/tmp"),
+    machine: Annotated[str, typer.Option("--machine", help="machine profile to record in campaign.yaml")] = "orion",
+    limit: Annotated[Optional[int], typer.Option("--limit", "-n", help="only this many structures, for a quick check")] = None,
+    quiet: Annotated[bool, typer.Option("--quiet", "-q")] = False,
+) -> None:
+    """Adopt a finished legacy campaign into cspflow's own layout.
+
+    Reads all six of a legacy flow's result artefacts -- not just its VASP
+    directories, which is what `csp ingest` does -- and writes the campaign
+    cspflow would have written had it run the work itself.  Nothing is
+    recomputed and nothing in the source directory is touched.
+
+    The VASP outputs are 549 GB and stay where they are; `dft_dir` and
+    `job.workdir` point at them, and `campaign_meta['legacy.root']` records the
+    prefix so a move needs one UPDATE rather than a re-adoption.
+    """
+    import os
+
+    dest = Path(os.path.expandvars(str(dest)))
+    names = list(LEGACY_REGISTRY) if flow == "all" else [flow]
+    unknown = [n for n in names if n not in LEGACY_REGISTRY]
+    if unknown:
+        _die(f"unknown legacy campaign(s) {unknown}. Known: {', '.join(LEGACY_REGISTRY)}")
+
+    def say(message: str) -> None:
+        if not quiet:
+            typer.echo(message, err=True)
+
+    for name in names:
+        say(f"{name}  <-  {LEGACY_REGISTRY[name].root}")
+        try:
+            stats = adopt_legacy(LEGACY_REGISTRY[name], dest, staging=staging,
+                          limit=limit, machine=machine,
+                          progress=None if quiet else say)
+        except LegacyError as exc:
+            _die(str(exc))
+        typer.echo(stats.render())
+        typer.echo(f"\nwrote {dest / name}\n")
+
+
+@app.command()
 def source(
     campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
     set_: SetOpt = None,
@@ -225,7 +370,7 @@ def source(
     commit is capped.
     """
     cfg = _load(campaign, set_)
-    base = Path(campaign).resolve().parent
+    base = cfg.base_dir
 
     try:
         plan = expand_all(cfg.campaign, base)
@@ -244,6 +389,7 @@ def source(
 
     target = db or _db_path(cfg)
     target.parent.mkdir(parents=True, exist_ok=True)
+    _link_results(Path(campaign), Path(cfg.campaign.workdir))
     store = Store.open(target) if target.is_file() else Store.create(
         target, campaign=cfg.campaign.name, config_hash=cfg.config_hash
     )
@@ -279,9 +425,10 @@ def run(
     a core-hour budget. The two are the same loop over a different stage slice.
     """
     cfg = _load(campaign, set_)
-    base = Path(campaign).resolve().parent
+    base = cfg.base_dir
     target = db or _db_path(cfg)
     target.parent.mkdir(parents=True, exist_ok=True)
+    _link_results(Path(campaign), Path(cfg.campaign.workdir))
 
     wanted = _stage_slice(through, from_, only)
     runnable = [name for name in wanted if name in IMPLEMENTED]
@@ -327,18 +474,30 @@ def _stage_slice(through: str | None, from_: str | None, only: str | None) -> li
 
 @app.command()
 def recipe(
-    name: Annotated[str, typer.Argument(help="shipped recipe name or a path")] = "magnets",
+    name: Annotated[Optional[str], typer.Argument(help="shipped recipe name or a path; default: this campaign's")] = None,
+    campaign: CampaignOpt = Path(DEFAULT_CAMPAIGN),
 ) -> None:
     """Print a recipe fully resolved -- every tag literal, nothing deferred.
 
-    This is what `inherit:` copying buys: there is no value here whose meaning
-    requires knowing pymatgen to predict.
+    With no argument this prints the recipe the campaign in this folder would
+    actually use, which is the question being asked most of the time. This is
+    what `inherit:` copying buys: there is no value here whose meaning requires
+    knowing pymatgen to predict.
     """
     from .dft.recipe import RecipeError, load_recipe, validate_recipe
     from .dft.vasp.incar import render_incar
 
+    base: Path | None = None
+    if name is None:
+        found = _find_campaign(campaign)
+        if found.is_file():
+            cfg = _load(found, None)
+            name, base = cfg.campaign.dft.recipe, cfg.base_dir
+        else:
+            name = "magnets"
+
     try:
-        loaded = load_recipe(name)
+        loaded = load_recipe(name, base)
         warnings = validate_recipe(loaded)
     except RecipeError as exc:
         _die(str(exc))
@@ -396,7 +555,7 @@ def report(
     if not db.is_file():
         _die(f"no campaign database at {db}. Run `csp init` and then a stage.")
 
-    directory = out or (Path(cfg.campaign.workdir) / "report")
+    directory = out or (cfg.base_dir / "report")
     with Store.open(db) as store:
         rows = candidate_rows(store, limit=limit or None)
         csv_path = write_csv(rows, directory / "candidates.csv")

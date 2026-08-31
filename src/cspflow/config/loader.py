@@ -176,12 +176,22 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def resolve_machine_path(name_or_path: str) -> Path:
-    """A machine may be named (shipped profile) or given as a path."""
+def resolve_machine_path(name_or_path: str, base_dir: Path | None = None) -> Path:
+    """A machine may be named (shipped profile) or given as a path.
+
+    A relative path is resolved against the campaign file's own folder, not the
+    working directory, so `machine: machine.yaml` means the copy sitting beside
+    campaign.yaml however deep in the tree you happen to be standing.
+    """
     p = Path(name_or_path)
     if p.suffix in {".yaml", ".yml"} or p.is_absolute() or os.sep in name_or_path:
+        if not p.is_absolute() and base_dir is not None and not p.is_file():
+            candidate = base_dir / p
+            if candidate.is_file():
+                return candidate
         if not p.is_file():
-            raise ConfigError(f"machine profile not found: {p}")
+            where = f" (looked in {base_dir})" if base_dir is not None and not p.is_absolute() else ""
+            raise ConfigError(f"machine profile not found: {p}{where}")
         return p
     shipped = MACHINES_DIR / f"{name_or_path}.yaml"
     if not shipped.is_file():
@@ -203,6 +213,17 @@ class ResolvedConfig:
     campaign_path: Path | None
     origins: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def base_dir(self) -> Path:
+        """The campaign folder: everything relative in the config resolves here.
+
+        A campaign is a folder, not a lone file -- machine.yaml, recipe.yaml and
+        inputs/ sit beside campaign.yaml -- so a relative path in the config has
+        to mean "beside the campaign file", never "beside wherever the user
+        happened to type the command".
+        """
+        return self.campaign_path.parent if self.campaign_path else Path.cwd()
 
     @property
     def campaign_db(self) -> Path:
@@ -262,7 +283,7 @@ def load_campaign(
         raise ConfigError(
             "no machine specified: set 'machine:' in the campaign file or pass --machine"
         )
-    mpath = resolve_machine_path(str(machine_name))
+    mpath = resolve_machine_path(str(machine_name), cpath.parent if cpath else None)
     machine_doc = _read_yaml(mpath)
 
     # A machine profile may carry site-specific campaign defaults under
