@@ -1,0 +1,42 @@
+# Sm-Fe-Ti shortlist -- one formula per line.
+#
+# Columns:  formula[,z_min,z_max,n_structures]
+#   formula       required. The REDUCED formula; z multiplies it.
+#   z_min,z_max   formula units to build. Blank -> source.defaults.z
+#   n_structures  structures for this formula. Blank -> source.defaults
+#
+# A blank cell inherits, so you never restate a column you are not changing.
+# A header row is optional (this file has one).
+#
+# Write formulas however you like: they are canonicalised and reduced on
+# read, so Sm2Fe17 is stored as Fe17Sm2 and Sm4Fe34 is the same row.
+#
+# Comments must be on a line of their OWN -- "#" is only honoured at the start
+# of a line. A trailing comment after data is read as part of the last cell and
+# fails with "column 4 (n_structures) is ... which is not an integer".
+#
+formula,z_min,z_max,n_structures
+#
+# --- the known phases, the ones the campaign must reproduce ---------------
+# the 2:17 magnet; 19 atoms/f.u., so z=2 is a 38-atom cell
+Sm2Fe17,1,2,80
+# ThMn12 -- unstable bare, which is why SmFe11Ti is the target below
+SmFe12,1,2,80
+# 13 atoms/f.u. already, so one formula unit is enough
+SmFe11Ti,1,1,120
+# small cells: cheap, and good calibration material
+SmFe5,1,3,40
+SmFe3,1,2,40
+# Laves phase
+SmFe2,1,4,40
+#
+# --- Ti substitution series ----------------------------------------------
+Sm2Fe16Ti,1,1,60
+Sm2Fe15Ti2,1,1,60
+SmFe10Ti2,1,2,60
+#
+# --- elemental references that anchor the hull ---------------------------
+# Trailing columns left blank: both take source.defaults.
+Sm,1,4
+Fe,1,4
+Ti,1,4

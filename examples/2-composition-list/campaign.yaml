@@ -1,0 +1,167 @@
+# ===========================================================================
+#  EXAMPLE 2 of 3 -- source mode: composition_list
+#
+#  "I know which formulas I want."  No enumeration: you give the list, cspflow
+#  generates structures for exactly those and nothing else. Same funnel from
+#  Stage 1 on -- generate, screen, dedup, hull, filter, DFT.
+#
+#  Two ways to give the list, and this example uses BOTH at once:
+#    inline `items:`   a handful you are looking at while you edit
+#    `from_file:`      a CSV you maintain separately (inputs/compositions.csv)
+#  They are concatenated. Use inline for exceptions, the file for the bulk.
+#
+#  Copy this folder, or:  csp init my-shortlist -m orion
+# ===========================================================================
+
+name: example-shortlist
+machine: orion
+workdir: /scratch/$USER/cspflow/example-shortlist
+archive: /projects/mmi/Ridwan/cspflow_archive/example-shortlist
+
+# ---------------------------------------------------------------------------
+# SOURCE
+# ---------------------------------------------------------------------------
+source:
+  - mode: composition_list
+    name: shortlist
+    composition_list:
+
+      # Inline items. Every field except `formula` is optional and falls back
+      # to `defaults` below, so a bare {formula: X} is a complete entry.
+      #
+      # Inline items are read BEFORE the file, and a formula that appears in
+      # both warns and keeps the first. So inline is the override: the file is
+      # the list you maintain, these are the exceptions you are making today.
+      items:
+
+        # An override. inputs/compositions.csv also has SmFe11Ti, at 120
+        # structures; this entry wins and the run warns that it did.
+        - formula: SmFe11Ti    # the reduced formula
+          z: {min: 1, max: 1}  # or the shorthand  z: [1, 1]
+          max_atoms: 26        # z * 13 atoms
+          n_structures:
+            mode: fixed        # fixed | per_atom
+            count: 150         # spend more on the phase you care most about
+
+        # The 3:29 phase -- not in the file, being tried for the first time.
+        - formula: Sm3Fe29Ti2
+          z: [1, 1]            # 34 atoms/f.u.; one unit is already a big cell
+          n_structures: {mode: fixed, count: 60}
+
+        - formula: SmFe9Ti3    # everything unset -> defaults below
+          z: [1, 2]
+
+        - {formula: Sm2Fe14Ti3, z: [1, 1]}    # flow style, same thing
+
+      # The bulk of the list, kept in a file so it can be generated, diffed and
+      # reviewed without touching the campaign. Path is relative to THIS file.
+      from_file: inputs/compositions.csv
+      # Columns: formula[,z_min,z_max,n_structures]; blank cells inherit;
+      # "#" comments and an optional header row are both fine.
+
+    defaults:
+      z: {min: 1, max: 2}
+      max_atoms: 60           # higher than the sweep in example 1: a chosen
+                              # formula is worth a bigger cell than a formula
+                              # that merely fell out of an enumeration
+      n_structures: {mode: per_atom, structures_per_atom: 3.0}
+      n_structures_scope: per_z
+
+# ---------------------------------------------------------------------------
+# GENERATE
+# ---------------------------------------------------------------------------
+generate:
+  engine: mattergen
+  mattergen:
+    model: /projects/mmi/shuo/MatterGen_checkpoints/18-55-08
+    mode: csp                 # composition-conditioned, which is the whole
+                              # point of naming the formulas
+    max_batch_size: 100
+    timeout_per_batch: 1800
+  resources: {role: gpu, gpus: 1, time: "12:00:00"}
+
+# ---------------------------------------------------------------------------
+# SCREEN + DEDUP
+# ---------------------------------------------------------------------------
+screen:
+  mlip: mattersim
+  mattersim:
+    model: MatterSim-v1.0.0-5M.pth
+    fmax: 0.01
+    max_steps: 800            # more than the sweep's 500: a short list can
+                              # afford to converge its cells properly
+    batch_size: 32
+  dedup:
+    matcher: {ltol: 0.2, stol: 0.2, angle_tol: 5.0}
+    # A shortlist generates many structures per formula, so this stage removes
+    # more here than it does in a broad sweep. Loosen the tolerances to merge
+    # harder; tighten them to keep near-degenerate polymorphs apart.
+  resources: {role: gpu, gpus: 1, time: "12:00:00"}
+
+# ---------------------------------------------------------------------------
+# REFERENCE
+# ---------------------------------------------------------------------------
+reference:
+  functionals: [GGA]
+  thermo_type: GGA_GGA+U
+  energy_scale: raw
+  mode: recompute             # see D101 before trusting a DFT hull
+  prescreen_mode: mp_energies
+  prescreen_hull_max: 0.15
+  snapshot: true
+  relax_with_mlip: true
+
+# ---------------------------------------------------------------------------
+# CALIBRATE
+# ---------------------------------------------------------------------------
+calibrate:
+  mp:
+    on_fail: warn
+    thresholds: {mae_e_per_atom: 0.05, spearman_min: 0.90, max_volume_drift: 0.05}
+  pilot:
+    on_fail: block
+    pilot_n: 25               # fewer than the sweep's 40: the chemistry here
+                              # is narrow, so a smaller sample is representative
+    thresholds: {mae_e_per_atom: 0.05, mae_e_hull: 0.05, spearman_min: 0.90}
+
+# ---------------------------------------------------------------------------
+# FILTER
+# ---------------------------------------------------------------------------
+filter:
+  e_above_hull_max: 0.05      # tighter than the sweep's 0.10. You already
+                              # believe in these formulas; what you want now is
+                              # the right polymorph, not a broad net.
+  e_above_hull_max_source: calibrated
+  max_per_composition: 10     # higher than the sweep's 5, for the same reason:
+                              # here each composition IS the question
+  spacegroup: {min_number: 3} # drop P1/P-1 -- with this many structures per
+                              # formula, the symmetric ones are the interesting
+
+# ---------------------------------------------------------------------------
+# DFT
+# ---------------------------------------------------------------------------
+dft:
+  recipe: magnets
+  potcar:
+    tree: VASP6.4
+    functional: PBE_64
+    overrides: {}             # e.g. {Sm: Sm_3, Ti: Ti_pv}
+  rare_earth: {f_treatment: frozen, magnetic_order: ferri, reconstruct_ms: true}
+  magnetism: {mode: ferrimagnetic_retm, strict: true}
+  ldau: {enabled: false, ldau_type: 2, u: {}, j: {}}
+  nbands: auto
+  incar_overrides: {}
+  max_in_flight: 120
+  max_concurrent_tasks: 32
+  select:
+    rank_by: e_above_hull_mlip
+    max_per_composition: 5
+    max_total: 400            # a shortlist should not need 1,500 VASP runs
+    budget_core_hours: 60000
+
+# ---------------------------------------------------------------------------
+# ANALYZE
+# ---------------------------------------------------------------------------
+analyze:
+  properties: [m_dft_raw, m_s_reconstructed, volume, spacegroup]
+  report: html

@@ -11,3 +11,13 @@ htmlcov/
 *.db-wal
 *.db-shm
 .env
+
+# scratch campaigns made by `csp init` while testing
+my-campaign/
+
+# superseded cover drafts; docs/assets/cspflow-cover-v3.png is the one in use
+docs/assets/cspflow-cover.png
+docs/assets/cspflow-cover-v2.png
+
+# the results symlink a campaign makes on its first run
+examples/*/results

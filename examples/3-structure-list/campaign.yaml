@@ -1,0 +1,209 @@
+# ===========================================================================
+#  EXAMPLE 3 of 3 -- source mode: structure_list
+#
+#  "I already have the structures."  Nothing is generated: the files in
+#  inputs/seeds/ are read, their composition is DERIVED from the file, and the
+#  rows enter the funnel at Stage 2 (screen). MatterGen is never invoked, and
+#  a campaign in this mode has NO `generate:` block at all.
+#
+#  Use it for: structures from a previous run or another code, experimental
+#  CIFs, prototypes you built by hand, or a control group to compare a
+#  generative sweep against.
+#
+#  The seeds here are real: five DFT-relaxed Sm-Fe structures exported from a
+#  finished campaign, including Sm2Fe17 (hR19) and SmFe12 (tI26).
+#
+#  Copy this folder, or:  csp init my-seeds -m orion
+# ===========================================================================
+
+name: example-seeds
+machine: orion
+workdir: /scratch/$USER/cspflow/example-seeds
+archive: /projects/mmi/Ridwan/cspflow_archive/example-seeds
+
+# ---------------------------------------------------------------------------
+# SOURCE
+# ---------------------------------------------------------------------------
+source:
+  - mode: structure_list
+    name: seeds
+    structure_list:
+
+      # A folder, a glob, or individual files -- mix them freely. Paths are
+      # relative to THIS file, so the campaign folder stays movable.
+      paths:
+        - inputs/seeds              # a folder is walked for structure files
+        # - inputs/seeds/*.vasp     # a glob does the same thing explicitly
+        # - inputs/one-off/CONTCAR  # a single file
+        # - /scratch/$USER/old-run/relaxed   # absolute paths work too
+        #
+        # Recognised: .vasp .poscar .contcar .cif .xyz .extxyz .res .json, and
+        # any file named POSCAR or CONTCAR. Anything else in a folder is
+        # IGNORED rather than guessed at, so leaving a README beside your
+        # seeds is not an error.
+        #
+        # Every file is parsed by BOTH pymatgen and ASE and the two must agree
+        # on the composition. Neither is safe alone: pymatgen invents H and He
+        # for a VASP-4 POSCAR with no element line (warning only), and ASE
+        # silently drops the minority species of a partial-occupancy CIF. The
+        # cost is milliseconds; the failure it prevents is a published number
+        # for a material that was never computed.
+
+      relax: true                   # MLIP-relax each seed before screening.
+                                    # false only if they are ALREADY relaxed
+                                    # with the same MLIP -- otherwise the seeds
+                                    # sit on a different energy surface from
+                                    # everything they are compared against.
+
+      dedup: warn                   # warn | drop.  'warn' is the default here
+                                    # and the right one for a curated list: two
+                                    # seeds you supplied on purpose -- say a
+                                    # relaxed and an unrelaxed copy of one
+                                    # prototype -- would otherwise be merged
+                                    # silently and you would never learn which
+                                    # one survived. In a generated sweep,
+                                    # dropping duplicates is the entire point;
+                                    # in a seed list it is a hazard.
+
+      max_atoms: 60                 # a seed larger than this is refused at
+                                    # ingest, not after GPU time is spent.
+                                    # The Sm2Fe17 seed is 57 atoms, so this
+                                    # cap has to clear it.
+
+  # -------------------------------------------------------------------------
+  # A second source, for the pattern worth knowing: seeds as a CONTROL GROUP.
+  #
+  # Uncomment and this campaign generates SmFe11Ti candidates alongside the
+  # hand-picked seeds, in one database, on one hull, with one calibration. The
+  # `name` on each source is what keeps the answer to "did this candidate come
+  # from my seed list or from the generator?" available afterwards -- which is
+  # the only thing that makes it a control group rather than a mixture.
+  #
+  # A campaign with a composition_list or chemical_space source needs a
+  # `generate:` block; the seeds-only campaign below does not.
+  # -------------------------------------------------------------------------
+  # - mode: composition_list
+  #   name: generated-control
+  #   composition_list:
+  #     items:
+  #       - {formula: SmFe11Ti, z: [1, 1], n_structures: {mode: fixed, count: 200}}
+  #       - {formula: Sm2Fe17,  z: [1, 2], n_structures: {mode: fixed, count: 200}}
+  #   defaults:
+  #     max_atoms: 60
+
+# ---------------------------------------------------------------------------
+# NO `generate:` BLOCK.
+#
+# This is the mode's defining feature. Omitting it is what tells the driver
+# that Stage 1 has nothing to do; `csp run --through calibrate` starts at
+# screen.
+#
+# It is not optional bookkeeping either way: a campaign whose sources all
+# supply structures must not have one, and adding a composition_list or
+# chemical_space source makes it REQUIRED --
+#
+#     source mode(s) ['composition_list'] generate structures,
+#     so a 'generate:' block is required
+#
+# so the control group above only works with the block below uncommented too.
+# ---------------------------------------------------------------------------
+# generate:
+#   engine: mattergen
+#   mattergen:
+#     model: /projects/mmi/shuo/MatterGen_checkpoints/18-55-08
+#     mode: csp
+#     max_batch_size: 100
+#     timeout_per_batch: 1800
+#   resources: {role: gpu, gpus: 1, time: "12:00:00"}
+
+# ---------------------------------------------------------------------------
+# SCREEN + DEDUP -- where these rows enter
+# ---------------------------------------------------------------------------
+screen:
+  mlip: mattersim                   # must be the SAME MLIP the hull is built
+                                    # with; mixing potentials between the seeds
+                                    # and the reference makes the comparison
+                                    # meaningless
+  mattersim:
+    model: MatterSim-v1.0.0-5M.pth
+    fmax: 0.005                     # tighter than a sweep's 0.01: five seeds
+                                    # cost nothing to converge properly
+    max_steps: 1000
+    batch_size: 8                   # small batch for a small list
+  dedup:
+    matcher: {ltol: 0.2, stol: 0.2, angle_tol: 5.0}
+  resources: {role: gpu, gpus: 1, time: "04:00:00"}
+
+# ---------------------------------------------------------------------------
+# REFERENCE -- seeds still need a hull to be measured against
+# ---------------------------------------------------------------------------
+reference:
+  functionals: [GGA]
+  thermo_type: GGA_GGA+U
+  energy_scale: raw
+  mode: recompute                   # see D101 before trusting a DFT hull
+  prescreen_mode: mp_energies
+  prescreen_hull_max: 0.30          # wide: you did not pick these seeds for
+                                    # their hull distance, and a seed above the
+                                    # hull is often the point of the exercise
+  snapshot: true
+  relax_with_mlip: true
+
+# ---------------------------------------------------------------------------
+# CALIBRATE
+# ---------------------------------------------------------------------------
+calibrate:
+  mp:
+    on_fail: warn
+    thresholds: {mae_e_per_atom: 0.05, spearman_min: 0.90, max_volume_drift: 0.05}
+  pilot:
+    on_fail: warn                   # warn, not block: with five seeds there is
+                                    # no ranking decision big enough for a
+                                    # rank-correlation gate to protect
+    pilot_n: 5
+    thresholds: {mae_e_per_atom: 0.05, mae_e_hull: 0.05, spearman_min: 0.80}
+
+# ---------------------------------------------------------------------------
+# FILTER
+# ---------------------------------------------------------------------------
+filter:
+  e_above_hull_max: 0.20            # loose. A curated seed you meant to
+                                    # compute should not be filtered out by a
+                                    # cutoff tuned for a 165,000-structure
+                                    # sweep. Set it to a large number to send
+                                    # every seed to DFT.
+  e_above_hull_max_source: literal  # literal, not calibrated: with a handful of
+                                    # structures the calibration offset is
+                                    # measured too poorly to shift a cut by
+  max_per_composition: 10
+  spacegroup: {min_number: 1}       # keep everything -- a P1 seed is a seed you
+                                    # chose, not generator noise
+
+# ---------------------------------------------------------------------------
+# DFT
+# ---------------------------------------------------------------------------
+dft:
+  recipe: magnets
+  potcar:
+    tree: VASP6.4
+    functional: PBE_64
+    overrides: {}
+  rare_earth: {f_treatment: frozen, magnetic_order: ferri, reconstruct_ms: true}
+  magnetism: {mode: ferrimagnetic_retm, strict: true}
+  ldau: {enabled: false, ldau_type: 2, u: {}, j: {}}
+  nbands: auto
+  incar_overrides: {}
+  max_in_flight: 20
+  max_concurrent_tasks: 8
+  select:
+    rank_by: e_above_hull_mlip
+    max_per_composition: 5
+    max_total: 50
+    budget_core_hours: 5000
+
+# ---------------------------------------------------------------------------
+# ANALYZE
+# ---------------------------------------------------------------------------
+analyze:
+  properties: [m_dft_raw, m_s_reconstructed, volume, spacegroup]
+  report: html
