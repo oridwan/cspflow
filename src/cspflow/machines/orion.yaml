@@ -49,7 +49,6 @@ env:
   # `csp doctor` checks that every env value that looks like a path is there.
   I_MPI_PMI_LIBRARY: /usr/lib64/libpmi.so.0
 
-# Your installation, not Shuo's.
 codes:
   vasp_std: /projects/mmi/Ridwan/potcarFiles/VASP6.4/vasp.6.4.3/bin/vasp_std
   mpi_launcher: "srun --mpi=pmi2"
@@ -69,7 +68,7 @@ potcar_trees:
 # One environment for every role.  mattergen depends on mattersim, so they were
 # always meant to share an env; the legacy split (mattersim for MLIP, vaspflow
 # for DFT) is what forced every driver script to know which env each stage
-# needed.  Built by scripts/build_env.sh; see docs/DECISIONS.md D025.
+# needed.  Built by scripts/build_env.sh; see docs/dev/DECISIONS.md D025.
 conda:
   cpu: cspflow
   gpu: cspflow
