@@ -38,9 +38,3 @@ run can be stopped, inspected and resumed at any point.
 source ──► generate ──► screen ──► dedup ──► reference ──► calibrate ──► filter ──► dft ──► analyze
 └─────────────── Phase A: cheap, run to completion ────────────────┘     └ Phase B: expensive, streamed ┘
 ```
-
-## A note on what is not here
-
-[`dev/`](dev/) holds the design and build records — the reasoning behind each
-choice, the measurements, the decision log. Useful if you are changing cspflow;
-not needed to use it.

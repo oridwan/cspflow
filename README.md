@@ -165,12 +165,6 @@ scales, measured **~0.19 eV/atom** apart in Fe-Sm-Ti against a **0.06 eV/atom**
 selection threshold. `analyze` warns when a hull mixes scales, and Phase A gates
 on the MLIP hull, which is unaffected.
 
-## How it was built
-
-[`docs/dev/`](docs/dev/) holds the design document, the decision log with the
-measurement behind each choice, the architecture notes and the build record.
-Useful if you are changing cspflow; not needed to use it.
-
 ## License
 
 MIT.
